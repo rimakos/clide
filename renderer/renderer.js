@@ -358,6 +358,7 @@ function renderViewer() {
   }
   const t = s.viewerTabs[s.activeViewer];
   updateNav();
+  if (t.kind === 'welcome') return renderWelcome(s, t);
   if (t.kind === 'diff') return renderDiff(t);
   if (t.kind === 'image') return renderImage(t);
   if (t.kind === 'html') return renderHtml(s, t);
@@ -481,6 +482,42 @@ function renderText(s, t) {
   const save = btn('Save ⌘S', 'alt', () => saveTab(s, t));
   pane.appendChild(toolbar([copy, save, spacer(), hint(t.ext || 'text')]));
   pane.appendChild(ta);
+  viewer.appendChild(pane);
+}
+
+function renderWelcome(s, t) {
+  const pane = document.createElement('div'); pane.className = 'pane';
+  const body = document.createElement('div');
+  body.style.cssText = 'flex:1; overflow:auto; padding:32px 40px; max-width:720px; line-height:1.55;';
+  body.innerHTML = `
+    <h1 style="margin:0 0 4px; font-size:22px;">Welcome to Clide</h1>
+    <p style="opacity:.7; margin:0 0 24px;">A terminal running <code>claude</code> on the left, typed file viewers on the right.</p>
+    <h2 style="font-size:15px; margin:0 0 6px;">Optional: agentic-dev-os</h2>
+    <p style="opacity:.8; margin:0 0 12px;">A bundled Claude Code workflow — lifecycle skills
+      (<code>/ticket-impact</code>, <code>/wrap</code>, <code>/goal</code>, …) plus a knowledge wiki.
+      Installing copies the skills into <code>~/.claude/skills</code> so they're available in every
+      Claude session. Skip it and Clide still works fully.</p>
+    <div id="os-status" style="white-space:pre-wrap; font-family:monospace; font-size:12px; opacity:.75; margin:14px 0; max-height:180px; overflow:auto;"></div>
+  `;
+  const status = body.querySelector('#os-status');
+
+  const install = btn('Install agentic-dev-os skills', 'primary', async () => {
+    install.disabled = true; install.textContent = 'Installing…'; status.textContent = '';
+    try {
+      const r = await ipcRenderer.invoke('install-os');
+      status.textContent = r.output || (r.ok ? 'Done.' : 'Failed.');
+      install.textContent = r.ok ? 'Installed ✓ — restart Claude to load them' : 'Retry install';
+      install.disabled = !r.ok;
+    } catch (e) { status.textContent = String(e.message || e); install.textContent = 'Retry install'; install.disabled = false; }
+  });
+  const map = btn('Open the map', 'alt', async () => {
+    const wp = await ipcRenderer.invoke('welcome-file');
+    if (wp) openInSession(activeKey, wp);
+  });
+  const skip = btn('Skip', 'alt', () => { const i = s.viewerTabs.indexOf(t); if (i >= 0) closeTab(i); });
+
+  pane.appendChild(toolbar([install, map, spacer(), skip]));
+  pane.appendChild(body);
   viewer.appendChild(pane);
 }
 
@@ -920,7 +957,7 @@ function saveState() {
   try {
     const data = order.map(k => {
       const s = sessions.get(k);
-      const tabs = s.viewerTabs.filter(t => t.kind !== 'diff').map(t => t.path);
+      const tabs = s.viewerTabs.filter(t => t.kind !== 'diff' && t.kind !== 'welcome').map(t => t.path);
       const act = s.viewerTabs[s.activeViewer];
       return { cwd: s.cwd, resumeId: s.resumeId || null, title: s.title, tabs, active: act ? act.path : null };
     });
@@ -942,10 +979,10 @@ window.addEventListener('beforeunload', saveState);
   }
   const { cwd, explicit } = await ipcRenderer.invoke('initial-cwd');
   await startSession({ cwd });
-  // First launch → open the agentic-dev-os map so colleagues see the OS + skills.
+  // First launch → open the welcome tab (intro + one-click skills install + map).
   if (!localStorage.getItem('clide-welcomed')) {
-    const wp = await ipcRenderer.invoke('welcome-file');
-    if (wp) await openInSession(activeKey, wp);
+    const s = cur();
+    if (s) { addTab(s, { path: 'welcome:os', name: 'Welcome', kind: 'welcome' }); renderTabbar(); renderViewer(); }
     localStorage.setItem('clide-welcomed', '1');
   }
   if (!explicit) openHistory(); // Finder launch → let the user jump to a recent repo/chat

@@ -53,6 +53,16 @@ ipcMain.handle('welcome-file', () => {
   return fs.existsSync(p) ? p : null;
 });
 
+// Install the bundled agentic-dev-os skills into ~/.claude/skills (opt-in, from the
+// welcome tab's button). Runs bin/setup-os and returns its output.
+ipcMain.handle('install-os', () => new Promise((resolve) => {
+  const script = path.join(__dirname, 'bin', 'setup-os');
+  if (!fs.existsSync(script)) return resolve({ ok: false, output: 'setup-os not found' });
+  execFile('/bin/bash', [script], { timeout: 60000 }, (err, stdout, stderr) => {
+    resolve({ ok: !err, output: ((stdout || '') + (stderr || '')).trim() });
+  });
+}));
+
 ipcMain.handle('session-start', (_e, { cwd, resumeId }) => {
   const key = 'S' + (++seq);
   const shellPath = process.env.SHELL || '/bin/zsh';

@@ -15,9 +15,10 @@ On your first launch, Clide opens its clickable map
 ([`agentic-dev-os/docs/visualiser.html`](agentic-dev-os/docs/visualiser.html)) as the
 first tab so you can see the whole flow, the skills, and what fires when.
 
-It's **optional** — Clide works fully without it. `./bin/install` does not install the
-skills; run `npm run setup-os` (or `./bin/install --with-os`) only if you want them in
-`~/.claude/skills`. Not interested? Ignore it — nothing touches your Claude config.
+It's **optional** — Clide works fully without it. The Welcome tab has a one-click
+**Install** button; or run `npm run setup-os` (or `./bin/install --with-os`). All copy
+the skills into `~/.claude/skills`. Not interested? Ignore it — nothing touches your
+Claude config unless you ask.
 
 > Browse the map on GitHub:
 > [github.com/rimakos/clide/blob/main/agentic-dev-os/docs/visualiser.html](https://github.com/rimakos/clide/blob/main/agentic-dev-os/docs/visualiser.html)

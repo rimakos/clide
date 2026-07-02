@@ -27,12 +27,13 @@ there. Close it and ignore it if you just want the editor.
 ## Optional: the agentic-dev-os skills
 
 Want the bundled workflow skills (`/ticket-impact`, `/wrap`, `/goal`, …) in your
-Claude sessions? Install them into `~/.claude/skills`:
+Claude sessions? Three ways:
 
-```bash
-npm run setup-os                 # add --force to overwrite skills you already have
-# or bundle it into the first install:  ./bin/install --with-os
-```
+- **Click Install** on the Welcome tab that opens on first launch — one button, done.
+- `npm run setup-os` (add `--force` to overwrite skills you already have).
+- `./bin/install --with-os` to bundle it into the first install.
+
+All three copy the skills into `~/.claude/skills`. Restart Claude to load them.
 
 Not interested? Do nothing — Clide never touches `~/.claude/skills` unless you run
 this.
