@@ -10,9 +10,9 @@ cd clide
 ./bin/install
 ```
 
-That installs deps, rebuilds the native terminal module, puts `clide` on your PATH
-(asks for sudo once), and installs the bundled **agentic-dev-os** skills into
-`~/.claude/skills`.
+That installs deps, rebuilds the native terminal module, and puts `clide` on your PATH
+(asks for sudo once). Clide works fully on its own — the bundled agentic-dev-os is
+**not** installed by default.
 
 Then run:
 
@@ -21,7 +21,21 @@ clide .                  # open the current folder
 clide /path/to/repo
 ```
 
-On your first launch Clide opens the agentic-dev-os map as the first tab.
+On your first launch Clide opens the agentic-dev-os map as a tab so you know it's
+there. Close it and ignore it if you just want the editor.
+
+## Optional: the agentic-dev-os skills
+
+Want the bundled workflow skills (`/ticket-impact`, `/wrap`, `/goal`, …) in your
+Claude sessions? Install them into `~/.claude/skills`:
+
+```bash
+npm run setup-os                 # add --force to overwrite skills you already have
+# or bundle it into the first install:  ./bin/install --with-os
+```
+
+Not interested? Do nothing — Clide never touches `~/.claude/skills` unless you run
+this.
 
 ## Manual steps (if you'd rather not run the script)
 
@@ -29,7 +43,7 @@ On your first launch Clide opens the agentic-dev-os map as the first tab.
 npm install
 npm run rebuild                                   # native node-pty
 sudo ln -sf "$PWD/bin/clide" /usr/local/bin/clide # launcher on PATH
-npm run setup-os                                  # skills → ~/.claude/skills
+npm run setup-os                                  # OPTIONAL: skills → ~/.claude/skills
 ```
 
 ## Update
