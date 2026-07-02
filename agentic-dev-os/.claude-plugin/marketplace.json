@@ -1,0 +1,18 @@
+{
+  "name": "agentic-dev-os",
+  "owner": {
+    "name": "your-team",
+    "url": "https://github.com/your-org/agentic-dev-os"
+  },
+  "metadata": {
+    "description": "Portable agentic dev OS: ticket lifecycle skills + team knowledge wiki. Config-driven, domain-agnostic.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "agentic-dev-os",
+      "source": "./",
+      "description": "Install the full skill set: ticket-impact, cross-repo review/test, wrap, goal, wiki-ingest, wiki-lint, skill-workshop, mcp-impact, seed-test-data, ticket-testing."
+    }
+  ]
+}

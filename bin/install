@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# One-shot Clide installer. Run from the cloned repo:  ./bin/install
+# Does: deps → native rebuild → launcher on PATH → agentic-dev-os skills.
+set -e
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+cd "$ROOT"
+
+echo "==> Clide install ($ROOT)"
+
+# 1. Preflight
+[[ "$(uname)" == "Darwin" ]] || { echo "Clide is macOS-only." >&2; exit 1; }
+command -v node >/dev/null || { echo "Need Node 18+. Install from https://nodejs.org" >&2; exit 1; }
+command -v claude >/dev/null || echo "!! 'claude' CLI not found on PATH — install it before running Clide."
+
+# 2. Dependencies + native module
+echo "==> npm install"
+npm install
+echo "==> rebuild node-pty"
+npm run rebuild
+
+# 3. Launcher on PATH
+LINK=/usr/local/bin/clide
+echo "==> linking $LINK (may prompt for sudo)"
+sudo ln -sf "$ROOT/bin/clide" "$LINK"
+
+# 4. Skills
+echo "==> installing agentic-dev-os skills"
+"$ROOT/bin/setup-os"
+
+echo ""
+echo "Done. Run:  clide .    (or  clide /path/to/repo )"

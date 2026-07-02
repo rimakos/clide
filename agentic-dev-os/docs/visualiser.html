@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>agentic-dev-os — how the flow works</title>
+<style>
+  :root{
+    --bg:#0c0e14; --panel:#141824; --panel2:#1b2030; --line:#2a3145;
+    --ink:#e8ecf4; --dim:#8b93a7; --accent:#6ea8fe; --accent2:#7ee0b8;
+    --warn:#f5c66b; --core:#b79cff; --radius:14px;
+    --font:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font);-webkit-font-smoothing:antialiased}
+  a{color:var(--accent)}
+  .wrap{max-width:1180px;margin:0 auto;padding:38px 24px 80px}
+  header h1{font-size:30px;margin:0 0 6px;letter-spacing:-.5px}
+  header p{color:var(--dim);margin:0;font-size:15px;max-width:760px;line-height:1.5}
+  .tag{display:inline-block;font-family:var(--mono);font-size:11px;color:var(--accent);
+    border:1px solid var(--line);border-radius:20px;padding:3px 10px;margin-bottom:16px}
+  h2{font-size:14px;text-transform:uppercase;letter-spacing:1.5px;color:var(--dim);
+    margin:44px 0 16px;font-weight:600}
+
+  /* loop diagram */
+  .loop{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;position:relative}
+  .node{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    padding:16px 15px;cursor:pointer;transition:.15s;position:relative;min-height:104px}
+  .node:hover{border-color:var(--accent);transform:translateY(-2px)}
+  .node.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 10px 30px -12px rgba(110,168,254,.5)}
+  .node .step{font-family:var(--mono);font-size:11px;color:var(--dim)}
+  .node .name{font-size:15px;font-weight:650;margin:7px 0 5px}
+  .node .name code{font-family:var(--mono);font-size:13px;color:var(--accent2)}
+  .node .sub{font-size:12.5px;color:var(--dim);line-height:1.45}
+  .node .kind{position:absolute;top:12px;right:12px;width:8px;height:8px;border-radius:50%}
+  .k-skill{background:var(--accent2)} .k-step{background:var(--dim)} .k-core{background:var(--core)}
+  .arrow{color:var(--line);text-align:center;font-size:20px;align-self:center}
+
+  .feedback{margin-top:14px;display:flex;align-items:center;gap:12px;
+    background:linear-gradient(90deg,rgba(126,224,184,.08),transparent);
+    border:1px dashed var(--line);border-radius:var(--radius);padding:14px 16px}
+  .feedback .lbl{font-family:var(--mono);font-size:12px;color:var(--accent2);white-space:nowrap}
+  .feedback .txt{font-size:13px;color:var(--dim);line-height:1.45}
+
+  /* support rows */
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  @media(max-width:820px){.loop{grid-template-columns:1fr 1fr}.grid{grid-template-columns:1fr}}
+
+  /* detail panel */
+  .detail{position:sticky;bottom:16px;margin-top:26px;background:var(--panel2);
+    border:1px solid var(--line);border-radius:var(--radius);padding:20px 22px;min-height:150px}
+  .detail .d-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+  .detail h3{margin:0;font-size:19px}
+  .detail .trig{font-family:var(--mono);font-size:12px;color:var(--warn)}
+  .detail .row{display:grid;grid-template-columns:120px 1fr;gap:10px;padding:8px 0;
+    border-top:1px solid var(--line);font-size:14px;line-height:1.5}
+  .detail .row .k{color:var(--dim);font-size:12.5px;text-transform:uppercase;letter-spacing:.5px}
+  .detail .empty{color:var(--dim);font-size:14px}
+  code{font-family:var(--mono)}
+  /* cost estimator */
+  .est{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:20px 22px}
+  .est .controls{display:flex;flex-wrap:wrap;gap:22px;margin-bottom:18px}
+  .est .ctl{display:flex;flex-direction:column;gap:7px}
+  .est .ctl .clbl{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim)}
+  .est .seg{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+  .est .seg button{background:transparent;color:var(--dim);border:0;padding:7px 12px;font-size:12.5px;cursor:pointer;font-family:var(--font)}
+  .est .seg button.on{background:var(--accent);color:#0b1020;font-weight:650}
+  .est .seg button+button{border-left:1px solid var(--line)}
+  .est label.chk{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink);cursor:pointer}
+  .est .price{display:flex;gap:10px;align-items:center}
+  .est .price input{width:62px;background:var(--bg);border:1px solid var(--line);color:var(--ink);border-radius:7px;padding:5px 7px;font-family:var(--mono);font-size:12px}
+  .est table{width:100%;border-collapse:collapse;margin-top:6px;font-size:13px}
+  .est th,.est td{text-align:right;padding:7px 10px;border-top:1px solid var(--line)}
+  .est th:first-child,.est td:first-child{text-align:left}
+  .est th{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.5px;font-weight:600}
+  .est td.sk{font-family:var(--mono);font-size:12px;color:var(--accent2)}
+  .est td.num{font-family:var(--mono);font-size:12.5px}
+  .est tr.total td{border-top:2px solid var(--accent);font-weight:700;color:var(--ink)}
+  .est tr.total td.num{color:var(--accent)}
+  .est .cost{font-size:22px}
+  .est .note{margin-top:12px;font-size:11.5px;color:var(--dim);line-height:1.5}
+  footer{margin-top:50px;color:var(--dim);font-size:12.5px;border-top:1px solid var(--line);padding-top:18px;line-height:1.6}
+  .legend{display:flex;gap:20px;flex-wrap:wrap;margin-top:8px;font-size:12px;color:var(--dim)}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <span class="tag">agentic-dev-os</span>
+  <header>
+    <h1>How the work flows</h1>
+    <p>A portable operating system for a multi-repo dev team. Every ticket runs the same loop: scope the blast radius before planning, implement, verify across repo boundaries, then feed what you learned back into a shared knowledge wiki so the next ticket is cheaper. Click any node to see the skill behind it.</p>
+  </header>
+
+  <h2>The ticket loop</h2>
+  <div class="loop" id="loop"></div>
+
+  <div class="feedback">
+    <span class="lbl">↺ the compounding loop</span>
+    <span class="txt">Every session ends by writing back to the wiki (repos, seams, decisions, gotchas). The next <code>ticket-impact</code> reads that wiki first, so the team gets faster at the same class of work instead of relearning it.</span>
+  </div>
+
+  <h2>Keeps the wiki healthy</h2>
+  <div class="grid" id="wiki-ops"></div>
+
+  <h2>Extends the OS</h2>
+  <div class="grid" id="meta"></div>
+
+  <h2>Cost estimator</h2>
+  <div class="est">
+    <div class="controls">
+      <div class="ctl">
+        <span class="clbl">Ticket difficulty</span>
+        <div class="seg" id="seg-diff">
+          <button data-d="0">Trivial</button>
+          <button data-d="1">Small</button>
+          <button data-d="2" class="on">Medium</button>
+          <button data-d="3">Large</button>
+          <button data-d="4">Cross-repo epic</button>
+        </div>
+      </div>
+      <div class="ctl">
+        <span class="clbl">Mode</span>
+        <div class="seg" id="seg-mode">
+          <button data-m="0" class="on">Quick (no deep)</button>
+          <button data-m="1">Deep (fan-out + verify)</button>
+        </div>
+      </div>
+      <div class="ctl">
+        <span class="clbl">Path</span>
+        <div class="seg" id="seg-path">
+          <button data-p="quick" class="on">Quick path</button>
+          <button data-p="full">Full path</button>
+        </div>
+      </div>
+      <div class="ctl">
+        <span class="clbl">Model rate ($/1M in · out)</span>
+        <div class="price">
+          <div class="seg" id="seg-model">
+            <button data-in="5" data-out="25" class="on">Opus 4.8</button>
+            <button data-in="3" data-out="15">Sonnet 5</button>
+            <button data-in="1" data-out="5">Haiku 4.5</button>
+          </div>
+          <input id="pIn" value="5" title="input $/1M"> /
+          <input id="pOut" value="25" title="output $/1M">
+        </div>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Skill / phase</th><th>Input tok</th><th>Output tok</th><th>Cost</th></tr></thead>
+      <tbody id="est-rows"></tbody>
+      <tfoot><tr class="total"><td id="tName">Flow total</td><td class="num" id="tIn"></td><td class="num" id="tOut"></td><td class="num cost" id="tCost"></td></tr></tfoot>
+    </table>
+    <p class="note" id="est-note"></p>
+  </div>
+
+  <div class="detail" id="detail">
+    <p class="empty">Select a node above to see what it does, when it fires, and what it produces.</p>
+  </div>
+
+  <footer>
+    <div class="legend">
+      <span><i class="dot k-step"></i> lifecycle step</span>
+      <span><i class="dot k-skill"></i> skill (a <code>/command</code>)</span>
+      <span><i class="dot k-core"></i> the knowledge wiki</span>
+    </div>
+    <p>Config-driven: skills resolve your repos, seams, and ticket source from <code>os-config.yaml</code>. Nothing here is tied to a specific product or domain. See <code>docs/flow.md</code> for the written version and <code>README.md</code> to install.</p>
+  </footer>
+</div>
+
+<script>
+const NODES = {
+  ticket: {kind:'k-step', step:'01', name:'Ticket arrives', title:'A ticket lands',
+    trigger:'—', when:'Any new unit of work.',
+    produces:'The raw ask: requirement, acceptance criteria, comments.',
+    why:'Nothing starts in code. The ask is the input to impact analysis, not the editor.'},
+  impact: {kind:'k-skill', step:'02', name:'<code>/ticket-impact</code>', title:'ticket-impact',
+    trigger:'/ticket-impact · "scope this ticket" · "what could this affect"',
+    when:'Before writing a plan or any code.',
+    produces:'A compact impact-aware pre-plan + Implementation Handoff: hidden scope (validators, generated clients, cloning paths, edge cases), likely reviewer comments, and a Cross-repo mini-spec when a seam is touched.',
+    why:'Catches wider-scope ripple upfront instead of as PR comments later. Routes to a repo’s local rules dir (os-config.yaml repo_local_os) when one exists, instead of loading the whole tree.'},
+  spec: {kind:'k-step', step:'03', name:'Cross-repo spec', title:'Spec-driven cross-repo workflow',
+    trigger:'triggered by ticket-impact when a contract / seam / multi-repo surface is touched',
+    when:'Contract, data-shape, or multi-repo tickets only. Skipped for single-repo tweaks.',
+    produces:'An invariant statement, an evidence ranking, and a system touch map (every repo/seam marked touched or not, with positive evidence for the untouched ones).',
+    why:'Cross-repo bugs live at the seams. Stating the invariant before opening a file keeps the change surgical and the tests honest.'},
+  plan: {kind:'k-step', step:'04', name:'Plan', title:'Write the plan',
+    trigger:'—', when:'After impact is understood.',
+    produces:'A step-by-step implementation plan scoped to exactly the surfaces impact analysis flagged.',
+    why:'The plan inherits the blast radius from ticket-impact, so it does not miss the generated client or the migration.'},
+  build: {kind:'k-step', step:'05', name:'Implement', title:'Implement (subagent-driven)',
+    trigger:'—', when:'Execution.',
+    produces:'The change. Coupled tasks run in one agent; independent tasks fan out to parallel agents; the main agent orchestrates and drift-checks.',
+    why:'Keeps the main context clean and parallelizes independent work. Never commits or pushes: the human does that.'},
+  review: {kind:'k-skill', step:'06', name:'<code>/cross-repo-review</code> · <code>/pr-ticket-review</code>', title:'Review the change',
+    trigger:'/cross-repo-review · /cross-repo-manual-test · /pr-ticket-review',
+    when:'On a diff or PR before merge.',
+    produces:'cross-repo-review checks the diff against the stated invariant and touch map. pr-ticket-review maps each ticket requirement to the diff (satisfied / partial / missing) and flags cross-repo ripple. cross-repo-manual-test builds an invariant-anchored manual test guide.',
+    why:'Reads PR content by SHA, not the working tree. Verifies every finding against the codebase and drops false positives before you post anything.'},
+  test: {kind:'k-skill', step:'07', name:'<code>/ticket-testing</code>', title:'ticket-testing',
+    trigger:'/ticket-testing · "test this ticket end to end"',
+    when:'To verify behavior in a real environment.',
+    produces:'Drives the real app (Playwright MCP) and reconciles every UI value against the read-only database. Picks existing test data; hands off to seed-test-data when the precondition is missing.',
+    why:'A fix is not done because it compiles. This confirms the invariant holds in the running app. Never modifies the DB, never posts, never commits.'},
+  capture: {kind:'k-skill', step:'08', name:'<code>/wrap</code> · <code>/goal</code>', title:'Capture what you learned',
+    trigger:'/wrap (end every session) · /goal (log an ADR)',
+    when:'End of session / end of ticket.',
+    produces:'wrap runs the fixed closing checklist: corrections patched, facts filed to the wiki, index updated, log appended (log written LAST). goal writes a compact ADR only when a decision would surprise a future reader.',
+    why:'This is the step that makes the loop compound. Skipping it means the next session relearns everything from chat history that no longer exists.'},
+  wiki: {kind:'k-core', step:'09', name:'Knowledge wiki', title:'The knowledge wiki',
+    trigger:'read first on every ticket · written last on every session',
+    when:'Always. It is the memory.',
+    produces:'index.md (catalog), log.md (chronology), system-map.md (topology), repos/ and seams/ pages, decisions/ (ADRs), features/. Every claim carries an evidence tag: ✅ confirmed / 🟡 inferred / ⬜ unknown.',
+    why:'Topology and gotchas live here once, not in ten people’s heads. ticket-impact reads it before scoping the next ticket, closing the loop.'},
+  ingest: {kind:'k-skill', step:'', name:'<code>/wiki-ingest</code>', title:'wiki-ingest',
+    trigger:'/wiki-ingest · "file this source"',
+    when:'A new source (ticket export, PR feedback, payload, meeting note) should enter the wiki.',
+    produces:'Files the source into raw/, updates every wiki page it touches, the index, and the log. Flags contradictions instead of silently overwriting.',
+    why:'Sources become durable, cross-linked knowledge instead of dying in a chat.'},
+  lint: {kind:'k-skill', step:'', name:'<code>/wiki-lint</code>', title:'wiki-lint',
+    trigger:'/wiki-lint · "wiki health check"',
+    when:'Periodically, or after several ingests.',
+    produces:'A fix list: contradictions, superseded claims, orphan pages, concepts mentioned 3+ times without a page, missing evidence tags, index/log drift. Applies only after you confirm.',
+    why:'Knowledge bases rot. This keeps the wiki trustworthy so people actually rely on it.'},
+  workshop: {kind:'k-skill', step:'', name:'<code>/skill-workshop</code>', title:'skill-workshop',
+    trigger:'/skill-workshop · "create a skill"',
+    when:'A repeatable piece of work should become a skill.',
+    produces:'A two-phase build: a compact design proposal first, then the SKILL.md after approval. Applies the same targeted-context, cost-efficient defaults as the rest of the OS.',
+    why:'Deterministic beats judgment. Anything you do the same way twice should be a skill, and this builds them consistently.'},
+  mcp: {kind:'k-skill', step:'', name:'<code>/mcp-impact</code>', title:'mcp-impact',
+    trigger:'/mcp-impact · "any mcp follow-up"',
+    when:'End of a branch, to decide if the change warrants MCP tooling.',
+    produces:'A reuse-first MCP impact plan (never writes MCP code). Enforces: no business-logic duplication, no raw DB access, no secret exposure, ownership checks, approval gates.',
+    why:'Grows the team’s tool surface deliberately and safely instead of by accident.'},
+  seed: {kind:'k-skill', step:'', name:'<code>/seed-test-data</code>', title:'seed-test-data',
+    trigger:'/seed-test-data · "set up precondition data"',
+    when:'A manual/QA test needs precondition state that does not exist to click through to.',
+    produces:'Seeds the parent+child rows directly in SQL so the tester lands at the test point. Ships a template seed.sql + cleanup.sql pair.',
+    why:'Pairs with ticket-testing: stop hand-building state, jump straight to the thing under test.'},
+};
+
+const LOOP = ['ticket','impact','spec','plan','build','review','test','capture','wiki'];
+const WIKI_OPS = ['ingest','lint','seed'];
+const META = ['workshop','mcp'];
+
+function card(id){
+  const n = NODES[id];
+  return `<div class="node" data-id="${id}">
+    <span class="kind ${n.kind}"></span>
+    ${n.step?`<div class="step">STEP ${n.step}</div>`:`<div class="step">SUPPORT</div>`}
+    <div class="name">${n.name}</div>
+    <div class="sub">${n.title}</div>
+  </div>`;
+}
+function arrowsBetween(ids){ // render loop with arrows in a 4-col grid: just cards, CSS grid handles layout
+  return ids.map(card).join('');
+}
+
+document.getElementById('loop').innerHTML = arrowsBetween(LOOP);
+document.getElementById('wiki-ops').innerHTML = WIKI_OPS.map(card).join('');
+document.getElementById('meta').innerHTML = META.map(card).join('');
+
+const detail = document.getElementById('detail');
+function show(id){
+  const n = NODES[id];
+  document.querySelectorAll('.node').forEach(el=>el.classList.toggle('active', el.dataset.id===id));
+  detail.innerHTML = `
+    <div class="d-head"><h3>${n.title}</h3><span class="trig">${n.trigger}</span></div>
+    <div class="row"><span class="k">When</span><span>${n.when}</span></div>
+    <div class="row"><span class="k">Produces</span><span>${n.produces}</span></div>
+    <div class="row"><span class="k">Why it matters</span><span>${n.why}</span></div>`;
+  detail.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+document.querySelectorAll('.node').forEach(el=>el.addEventListener('click',()=>show(el.dataset.id)));
+show('impact');
+
+/* ---- cost estimator ---- */
+// Base tokens (thousands) at Medium difficulty, Quick mode. Rough planning
+// heuristics for a real multi-repo team, not a billing guarantee.
+const EST = [
+  {name:'ticket-impact',           inK:45, outK:6,  paths:['quick','full']},
+  {name:'plan',                    inK:18, outK:5,  paths:['quick','full']},
+  {name:'implement (subagents)',   inK:60, outK:12, paths:['quick','full']},
+  {name:'cross-repo-review',       inK:32, outK:5,  paths:['quick','full']},
+  {name:'pr-ticket-review',        inK:38, outK:5,  paths:['full']},
+  {name:'cross-repo-manual-test',  inK:24, outK:4,  paths:['full']},
+  {name:'ticket-testing',          inK:50, outK:6,  paths:['full']},
+  {name:'wrap',                    inK:14, outK:3,  paths:['quick','full']},
+  {name:'goal',                    inK:10, outK:2,  paths:['full']},
+];
+const DIFF = [0.35, 0.6, 1.0, 1.8, 3.0];       // trivial..epic
+const DEEP_IN = 2.1, DEEP_OUT = 1.6;           // deep mode: subagents re-read context + verify passes
+const CACHE_FRAC = 0.45;                        // fraction of input served from prompt cache (0.1x price)
+const S = {diff:2, mode:0, path:'quick', pIn:5, pOut:25};
+
+const fmtTok = t => t>=1000 ? (t/1000).toFixed(t>=100000?0:1).replace(/\.0$/,'')+'M' : Math.round(t/1000)+'k';
+const fmtUsd = c => '$'+(c<10?c.toFixed(2):c.toFixed(1));
+
+function renderEst(){
+  const rows=document.getElementById('est-rows'); rows.innerHTML='';
+  let tin=0,tout=0,tcost=0;
+  const dm=DIFF[S.diff], di=S.mode?DEEP_IN:1, doo=S.mode?DEEP_OUT:1;
+  EST.filter(s=>s.paths.includes(S.path)).forEach(s=>{
+    const inTok=Math.round(s.inK*1000*dm*di);
+    const outTok=Math.round(s.outK*1000*dm*doo);
+    const effIn=inTok*(1-CACHE_FRAC + CACHE_FRAC*0.1);
+    const cost=effIn/1e6*S.pIn + outTok/1e6*S.pOut;
+    tin+=inTok; tout+=outTok; tcost+=cost;
+    rows.insertAdjacentHTML('beforeend',
+      `<tr><td class="sk">${s.name}</td><td class="num">${fmtTok(inTok)}</td><td class="num">${fmtTok(outTok)}</td><td class="num">${fmtUsd(cost)}</td></tr>`);
+  });
+  document.getElementById('tIn').textContent=fmtTok(tin);
+  document.getElementById('tOut').textContent=fmtTok(tout);
+  document.getElementById('tCost').textContent=fmtUsd(tcost);
+  document.getElementById('tName').textContent=(S.path==='quick'?'Quick path':'Full path')+' · '+(S.mode?'deep':'quick')+' total';
+  document.getElementById('est-note').textContent=
+    `Assumes ${Math.round(CACHE_FRAC*100)}% of input served from prompt cache (billed ~0.1×). `+
+    `Deep mode multiplies input ${DEEP_IN}× / output ${DEEP_OUT}× for subagent fan-out and adversarial verification. `+
+    `Numbers are planning heuristics for a multi-repo team — measure your own runs with count_tokens and adjust.`;
+}
+function bindSeg(id, apply){
+  document.querySelectorAll('#'+id+' button').forEach(b=>b.addEventListener('click',()=>{
+    document.querySelectorAll('#'+id+' button').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on'); apply(b); renderEst();
+  }));
+}
+bindSeg('seg-diff', b=>S.diff=+b.dataset.d);
+bindSeg('seg-mode', b=>S.mode=+b.dataset.m);
+bindSeg('seg-path', b=>S.path=b.dataset.p);
+bindSeg('seg-model', b=>{S.pIn=+b.dataset.in; S.pOut=+b.dataset.out;
+  document.getElementById('pIn').value=b.dataset.in; document.getElementById('pOut').value=b.dataset.out;});
+document.getElementById('pIn').addEventListener('input',e=>{S.pIn=parseFloat(e.target.value)||0; renderEst();});
+document.getElementById('pOut').addEventListener('input',e=>{S.pOut=parseFloat(e.target.value)||0; renderEst();});
+renderEst();
+</script>
+</body>
+</html>

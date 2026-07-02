@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Install the bundled agentic-dev-os skills into ~/.claude/skills so they're
+# available (/ticket-impact, /wrap, /goal, …) in every Claude session Clide runs.
+# Idempotent: skips a skill that already exists unless you pass --force.
+set -e
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+SRC="$ROOT/agentic-dev-os/skills"
+DEST="$HOME/.claude/skills"
+
+[[ -d "$SRC" ]] || { echo "setup-os: no bundled skills at $SRC" >&2; exit 1; }
+mkdir -p "$DEST"
+
+FORCE=""
+[[ "$1" == "--force" ]] && FORCE=1
+
+for d in "$SRC"/*/; do
+  name="$(basename "$d")"
+  if [[ -e "$DEST/$name" && -z "$FORCE" ]]; then
+    echo "skip  $name (exists — use --force to overwrite)"
+    continue
+  fi
+  rm -rf "$DEST/$name"
+  cp -R "$d" "$DEST/$name"
+  echo "ok    $name"
+done
+
+echo "Done. Skills in $DEST — restart Claude to pick them up."

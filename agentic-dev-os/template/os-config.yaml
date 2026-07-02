@@ -1,0 +1,88 @@
+# =============================================================================
+# agentic-dev-os — workspace config
+# =============================================================================
+# The single source of truth the skills read instead of hardcoding your repos.
+# Fill this in ONCE per workspace. Every skill (ticket-impact, cross-repo-review,
+# wrap, wiki-*, ...) resolves {{repos}}, {{seams}}, {{ticket_source}} from here.
+#
+# Copy this whole `template/` folder into your workspace root (next to your
+# repo checkouts), rename it to `.os/` (or keep as-is), and edit the values.
+# =============================================================================
+
+workspace:
+  name: my-platform                # your product / workspace name
+  # Where tickets live. Drives ticket-impact / wrap / testing skills' language.
+  ticket_source: Jira              # Jira | Linear | GitHub | Azure DevOps | Shortcut | ClickUp | ...
+  ticket_prefix: PROJ              # e.g. PROJ-1234 — used only for display
+
+# -----------------------------------------------------------------------------
+# repos — every checkout in the workspace and what it is.
+# `type` drives build/test assumptions and which review lens applies.
+# `role` is the one-line "backend of record" / "frontend SPA" summary.
+# -----------------------------------------------------------------------------
+repos:
+  - name: api
+    type: backend                  # backend | frontend | shared-lib | migrations | service | mobile
+    path: ../api
+    role: "Backend of record — owns the canonical data model"
+    tech: ".NET"                   # free text: .NET, Node, Go, Python, ...
+
+  - name: web
+    type: frontend
+    path: ../web
+    role: "Customer-facing SPA — calls api via a generated client"
+    tech: "React + TypeScript"
+
+  - name: shared-lib
+    type: shared-lib
+    path: ../shared-lib
+    role: "Shared package consumed by multiple repos"
+    tech: "TypeScript (npm)"
+
+  # Add one entry per repo. Delete the examples above.
+
+# -----------------------------------------------------------------------------
+# seams — integration boundaries BETWEEN repos. This is where cross-repo bugs
+# live, so ticket-impact and cross-repo-review key off these.
+#   connects: the two (or more) repos on each side
+#   mechanism: how they talk (REST, generated client, message bus, shared DB, ...)
+#   contract: what defines the wire shape (OpenAPI, protobuf, event schema, ...)
+#   notes: precision/serialization/ownership gotchas — the stuff that bites
+# -----------------------------------------------------------------------------
+seams:
+  - name: api-web
+    connects: [api, web]
+    mechanism: "REST + generated client"
+    contract: "OpenAPI spec"
+    notes: "Regenerate the client when the contract changes; verify the run actually completed."
+
+  - name: api-bus
+    connects: [api, "*"]
+    mechanism: "Async message bus"
+    contract: "Event payload schema"
+    notes: "Negative grep never proves a topic is unconsumed — subscriptions hide call sites."
+
+  # Add one entry per integration boundary. Delete the examples above.
+
+# -----------------------------------------------------------------------------
+# conventions — team working rules the skills enforce.
+# -----------------------------------------------------------------------------
+conventions:
+  evidence_tags: true              # every factual claim carries ✅ / 🟡 / ⬜ (see wiki/CLAUDE.md)
+  no_commit_push: true             # skills never stage/commit/push; the human does
+  targeted_search_only: true       # no broad repo-wide scans; targeted lookups only
+  read_pr_by_sha: true             # review skills read diffs by SHA, not the working tree
+  evidence_ranking:                # what outranks what when sources disagree
+    - "production data / payloads / logs"
+    - "code (file:line)"
+    - "docs / tickets"
+
+# -----------------------------------------------------------------------------
+# repo_local_os — OPTIONAL. Repos that carry their own agentic rules directory
+# (operating rules, known issues, standards, workflows). ticket-impact routes
+# to these instead of loading the whole tree. Leave empty if you have none.
+# -----------------------------------------------------------------------------
+repo_local_os:
+  # - repo: api
+  #   rules_dir: .ai/
+  #   authoritative_for: "api-specific conventions and known issues"

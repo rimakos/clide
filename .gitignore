@@ -1,0 +1,8 @@
+# deps + native builds (colleagues run `npm install` + `npm run rebuild`)
+node_modules/
+
+# packaged app output
+dist/
+
+# os cruft
+.DS_Store

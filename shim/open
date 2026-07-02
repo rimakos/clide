@@ -1,0 +1,39 @@
+#!/bin/bash
+# Clide `open` shim — route files Claude opens to the side panel instead of a macOS app.
+# Falls through to the real /usr/bin/open for URLs, missing files, or if the app is down.
+
+orig=("$@")
+target=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -a|-b) shift 2 ;;                          # app / bundle target — ignore
+    -e|-t|-g|-n|-F|-W|-R|-h|-j|-X|-s) shift ;; # value-less flags (TextEdit etc.)
+    --args) break ;;                           # everything after is process args
+    -*) shift ;;                               # any other flag — ignore
+    *) [[ -z "$target" ]] && target="$1"; shift ;;
+  esac
+done
+
+# URL or empty → real open
+if [[ -z "$target" || "$target" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*:// ]]; then
+  exec /usr/bin/open "${orig[@]}"
+fi
+
+# resolve to absolute against cwd
+case "$target" in
+  /*) abs="$target" ;;
+  *)  abs="$PWD/$target" ;;
+esac
+
+if [[ ! -f "$abs" ]]; then
+  exec /usr/bin/open "${orig[@]}"
+fi
+
+if curl -s -m 2 -X POST "http://127.0.0.1:${CLIDE_PORT:-8771}/open" \
+     --data-urlencode "path=$abs" --data-urlencode "session=${CLIDE_SESSION:-}" >/dev/null 2>&1; then
+  exit 0
+fi
+
+# app not reachable → fall back to the real open
+exec /usr/bin/open "${orig[@]}"

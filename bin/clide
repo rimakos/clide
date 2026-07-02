@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# clide <path>  — open a folder in Clide (the Claude terminal IDE), like `code .`
+set -e
+
+# Resolve through symlinks (e.g. /usr/local/bin/clide) to the real script dir.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+HOME_DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+TARGET="${1:-$PWD}"
+
+if [[ ! -d "$TARGET" ]]; then
+  echo "clide: not a directory: $TARGET" >&2
+  exit 1
+fi
+TARGET="$(cd "$TARGET" && pwd)"
+
+cd "$HOME_DIR"
+CLIDE_CWD="$TARGET" exec npx electron .

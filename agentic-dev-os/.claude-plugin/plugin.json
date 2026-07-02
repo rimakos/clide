@@ -1,0 +1,15 @@
+{
+  "name": "agentic-dev-os",
+  "version": "0.1.0",
+  "description": "A portable agentic operating system for multi-repo dev teams: a ticket lifecycle (scope -> plan -> implement -> cross-repo review/test -> capture) plus a team knowledge wiki. Config-driven, domain-agnostic.",
+  "author": "your-team",
+  "license": "MIT",
+  "keywords": [
+    "agentic",
+    "workflow",
+    "multi-repo",
+    "ticket-lifecycle",
+    "knowledge-base",
+    "claude-code"
+  ]
+}

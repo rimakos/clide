@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="../node_modules/@xterm/xterm/css/xterm.css" />
+  <link rel="stylesheet" id="hljs-theme" href="../node_modules/highlight.js/styles/atom-one-dark.css" />
+  <link rel="stylesheet" href="style.css" />
+  <title>Clide</title>
+</head>
+<body>
+  <div id="session-bar">
+    <div id="session-tabs"></div>
+    <button id="new-session" title="History &amp; new chat (⌘T)">
+      <svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 3v10 M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+
+  <div id="main">
+    <div id="explorer">
+      <div id="explorer-head">
+        <div id="panel-tabs">
+          <span class="ptab active" data-mode="files" title="Files (⌘B)">Files</span>
+          <span class="ptab" data-mode="git" title="Source control">Git<span id="git-count"></span></span>
+        </div>
+        <span id="explorer-toggle" title="Hide panel (⌘B)">
+          <svg viewBox="0 0 16 16" width="14" height="14"><path d="M10 4 L6 8 L10 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+      </div>
+
+      <div id="files-pane">
+        <div id="search-wrap">
+          <svg class="search-icon" viewBox="0 0 16 16" width="13" height="13"><circle cx="7" cy="7" r="4.2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10.2 10.2 L13.5 13.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          <input id="search" type="text" placeholder="Search files (⌘P)" spellcheck="false" autocomplete="off" />
+          <span id="search-clear" title="Clear">
+            <svg viewBox="0 0 16 16" width="12" height="12"><path d="M4 4 L12 12 M12 4 L4 12" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          </span>
+        </div>
+        <div id="tree"></div>
+        <div id="results"></div>
+      </div>
+
+      <div id="git-pane">
+        <div id="git-branch-row">
+          <span id="git-branch">—</span>
+          <span id="git-aheadbehind"></span>
+          <span id="git-refresh" title="Refresh">
+            <svg viewBox="0 0 16 16" width="13" height="13"><path d="M13 8a5 5 0 11-1.5-3.5 M13 2v3h-3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </span>
+        </div>
+        <div id="git-commit-box">
+          <textarea id="git-message" rows="2" placeholder="Commit message" spellcheck="false"></textarea>
+          <div id="git-actions">
+            <button id="git-commit" class="primary">Commit</button>
+            <button id="git-push">Push</button>
+          </div>
+        </div>
+        <div id="git-changes"></div>
+      </div>
+    </div>
+    <div id="divider-left"></div>
+    <div id="explorer-show" title="Show files (⌘B)">
+      <svg viewBox="0 0 16 16" width="14" height="14"><path d="M6 4 L10 8 L6 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </div>
+
+    <div id="terminals"></div>
+    <div id="divider"></div>
+
+    <div id="right">
+      <div id="viewer-nav">
+        <span class="nav-btn" id="nav-back" title="Back (⌘[)">
+          <svg viewBox="0 0 16 16" width="15" height="15"><path d="M10 3 L5 8 L10 13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        <span class="nav-btn" id="nav-fwd" title="Forward (⌘])">
+          <svg viewBox="0 0 16 16" width="15" height="15"><path d="M6 3 L11 8 L6 13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        <span class="nav-div"></span>
+        <span class="nav-btn" id="nav-undo" title="Undo (⌘Z)">
+          <svg viewBox="0 0 16 16" width="15" height="15"><path d="M6 5H10a3 3 0 010 6H7 M6 5L8.5 2.5 M6 5l2.5 2.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        <span class="nav-btn" id="nav-redo" title="Redo (⌘⇧Z)">
+          <svg viewBox="0 0 16 16" width="15" height="15"><path d="M10 5H6a3 3 0 000 6H9 M10 5L7.5 2.5 M10 5l-2.5 2.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        <span class="nav-path" id="nav-path"></span>
+      </div>
+      <div id="tabbar"></div>
+      <div id="viewer"><div class="empty">Files Claude opens appear here.</div></div>
+    </div>
+  </div>
+
+  <div id="statusbar">
+    <span class="st-item" id="st-model">—</span>
+    <span class="st-sep"></span>
+    <span class="st-item" id="st-ctx">—</span>
+    <span class="st-spacer"></span>
+    <span class="st-item" id="st-repo">—</span>
+    <span class="st-item" id="st-branch"></span>
+  </div>
+
+  <div id="history-overlay">
+    <div id="history-panel">
+      <div id="history-head">
+        <span class="h-h-title">Chats &amp; sessions</span>
+        <button id="new-here" class="primary">+ New chat</button>
+        <button id="history-new">Open a folder…</button>
+        <span id="history-close" title="Close">
+          <svg viewBox="0 0 16 16" width="14" height="14"><path d="M4 4 L12 12 M12 4 L4 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        </span>
+      </div>
+      <div id="recent-repos"></div>
+      <div id="history-filter">
+        <div id="hsearch-wrap">
+          <svg class="search-icon" viewBox="0 0 16 16" width="13" height="13"><circle cx="7" cy="7" r="4.2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10.2 10.2 L13.5 13.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          <input id="history-search" type="text" placeholder="Search chats" spellcheck="false" autocomplete="off" />
+        </div>
+        <select id="repo-filter"><option value="">All repos</option></select>
+      </div>
+      <div id="history-list"></div>
+    </div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
