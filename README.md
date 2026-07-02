@@ -10,10 +10,15 @@ fighting terminal copy-paste.
 
 Clide ships the **agentic-dev-os** — a portable, multi-repo agentic workflow packaged
 as a Claude Code plugin (lifecycle skills + a knowledge wiki). It lives in
-`agentic-dev-os/`. On your first launch, Clide opens its clickable map
-(`agentic-dev-os/docs/visualiser.html`) as the first tab so you can see the whole
-flow, the skills, and what fires when. Install the skills with `npm run setup-os`
-(see below).
+[`agentic-dev-os/`](agentic-dev-os/) — see its [README](agentic-dev-os/README.md).
+On your first launch, Clide opens its clickable map
+([`agentic-dev-os/docs/visualiser.html`](agentic-dev-os/docs/visualiser.html)) as the
+first tab so you can see the whole flow, the skills, and what fires when. Install the
+skills with `npm run setup-os` (see below).
+
+> Browse the map on GitHub:
+> [github.com/rimakos/clide/blob/main/agentic-dev-os/docs/visualiser.html](https://github.com/rimakos/clide/blob/main/agentic-dev-os/docs/visualiser.html)
+> — or clone and open it in a browser for the interactive version.
 
 ## Install (first time)
 
