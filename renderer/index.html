@@ -2,6 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'" />
   <link rel="stylesheet" href="../node_modules/@xterm/xterm/css/xterm.css" />
   <link rel="stylesheet" id="hljs-theme" href="../node_modules/highlight.js/styles/atom-one-dark.css" />
   <link rel="stylesheet" href="style.css" />
@@ -9,7 +10,19 @@
 </head>
 <body>
   <div id="session-bar">
+    <div id="brand"><span class="brand-mark">⌘</span><span>CLIDE</span></div>
     <div id="session-tabs"></div>
+    <div id="flight-controls">
+      <button id="attention-toggle" type="button" title="Attention inbox"><span class="attention-dot"></span> Attention <b id="attention-count">0</b></button>
+      <div id="layout-controls" aria-label="Terminal layout">
+        <button data-layout="single" title="Single pane">1</button>
+        <button data-layout="two-cols" title="Two columns">2│</button>
+        <button data-layout="two-rows" title="Two rows">2—</button>
+        <button data-layout="grid" title="Four-pane grid">4</button>
+        <button data-layout="focus" title="Focus active pane (⌘\)">Focus</button>
+      </div>
+      <button id="inspector-toggle" type="button" title="Toggle inspector (⌘I)">Inspector</button>
+    </div>
     <button id="new-session" title="History &amp; new chat (⌘T)">
       <svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 3v10 M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
     </button>
@@ -19,12 +32,25 @@
     <div id="explorer">
       <div id="explorer-head">
         <div id="panel-tabs">
-          <span class="ptab active" data-mode="files" title="Files (⌘B)">Files</span>
+          <span class="ptab" data-mode="files" title="Files (⌘B)">Files</span>
+          <span class="ptab active" data-mode="tasks" title="Tasks and worktrees">Tasks</span>
           <span class="ptab" data-mode="git" title="Source control">Git<span id="git-count"></span></span>
         </div>
         <span id="explorer-toggle" title="Hide panel (⌘B)">
           <svg viewBox="0 0 16 16" width="14" height="14"><path d="M10 4 L6 8 L10 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </span>
+      </div>
+
+      <div id="tasks-pane">
+        <div id="task-actions">
+          <button id="task-new" type="button">New isolated task</button>
+          <button id="task-import" type="button" title="Import a JSON array of tickets">Import</button>
+          <button id="workspace-backup" type="button" title="Export or restore Clide task state">Backup</button>
+          <button id="task-metrics" type="button" title="Private local workflow metrics">Metrics</button>
+          <button id="app-update" type="button" title="Check for signed updates">Update</button>
+          <button id="task-doctor" type="button" title="Check local setup">Doctor</button>
+        </div>
+        <div id="task-list"></div>
       </div>
 
       <div id="files-pane">
@@ -62,10 +88,25 @@
       <svg viewBox="0 0 16 16" width="14" height="14"><path d="M6 4 L10 8 L6 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </div>
 
-    <div id="terminals"></div>
+    <div id="terminal-column">
+      <div id="workspace-toolbar">
+        <span id="workspace-label">Branch flight deck</span>
+        <span id="workspace-summary">Each task owns one worktree.</span>
+        <span class="toolbar-spacer"></span>
+        <button id="workspace-orchestrator" type="button">◆ Orchestrator</button>
+        <button id="workspace-new-task" type="button">+ Isolated task</button>
+      </div>
+      <div id="terminals"></div>
+    </div>
     <div id="divider"></div>
 
     <div id="right">
+      <div id="inspector-tabs">
+        <button data-inspector="files" class="active">Files</button>
+        <button data-inspector="messages">Messages</button>
+        <button data-inspector="checks">Checks</button>
+        <button data-inspector="integrate">Integrate</button>
+      </div>
       <div id="viewer-nav">
         <span class="nav-btn" id="nav-back" title="Back (⌘[)">
           <svg viewBox="0 0 16 16" width="15" height="15"><path d="M10 3 L5 8 L10 13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -83,7 +124,8 @@
         <span class="nav-path" id="nav-path"></span>
       </div>
       <div id="tabbar"></div>
-      <div id="viewer"><div class="empty">Files Claude opens appear here.</div></div>
+      <div id="viewer"><div class="empty">Files agents open appear here.</div></div>
+      <div id="inspector-panel"></div>
     </div>
   </div>
 
@@ -100,7 +142,9 @@
     <div id="history-panel">
       <div id="history-head">
         <span class="h-h-title">Chats &amp; sessions</span>
-        <button id="new-here" class="primary">+ New chat</button>
+        <button id="new-here" class="provider-new claude">+ Claude</button>
+        <button id="new-codex-here" class="provider-new codex">+ Codex</button>
+        <button id="new-worktree" title="Create an isolated branch and agent session">Isolated task…</button>
         <button id="history-new">Open a folder…</button>
         <span id="history-close" title="Close">
           <svg viewBox="0 0 16 16" width="14" height="14"><path d="M4 4 L12 12 M12 4 L4 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
@@ -118,6 +162,30 @@
     </div>
   </div>
 
+  <div id="task-overlay" class="dialog-overlay" role="dialog" aria-modal="true" aria-labelledby="task-dialog-title">
+    <form id="task-dialog" class="dialog-card">
+      <div class="dialog-eyebrow">ISOLATED WORKTREE</div>
+      <h2 id="task-dialog-title">Launch a task</h2>
+      <p>Clide creates a branch-owned checkout, assigns a dev port, and starts the selected agent there.</p>
+      <div class="form-grid">
+        <label><span>Ticket</span><input id="task-ticket" placeholder="KAN-123" /></label>
+        <label class="wide"><span>Task title</span><input id="task-title" required placeholder="Add team billing" /></label>
+        <label class="wide"><span>Worker prompt</span><textarea id="task-prompt" rows="5" required placeholder="Describe the outcome, acceptance criteria, relevant paths, constraints, and checks for the worker."></textarea></label>
+        <label><span>Provider</span><select id="task-provider"><option value="claude">Claude</option><option value="codex">Codex</option></select></label>
+        <label><span>Base ref</span><input id="task-base" value="HEAD" /></label>
+        <label class="wide"><span>Branch</span><input id="task-branch" required placeholder="clide/kan-123-team-billing" /></label>
+        <label class="wide"><span>Setup command (optional)</span><input id="task-setup" placeholder="npm install" /></label>
+        <label class="wide"><span>Dev command (optional)</span><input id="task-dev" placeholder="npm run dev -- --port $PORT" /></label>
+        <label class="wide"><span>Dependencies (optional task IDs, comma separated)</span><input id="task-dependencies" placeholder="task-api, task-schema" /></label>
+      </div>
+      <div id="task-dialog-error"></div>
+      <div class="dialog-actions"><button id="task-cancel" type="button">Cancel</button><button class="primary" type="submit">Create and launch</button></div>
+    </form>
+  </div>
+
+  <script src="../node_modules/@xterm/xterm/lib/xterm.js"></script>
+  <script src="../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+  <script src="../node_modules/markdown-it/dist/markdown-it.min.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>

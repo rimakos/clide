@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# clide <path>  — open a folder in Clide (the Claude terminal IDE), like `code .`
+# clide <path>  — open a folder in the Clide agent terminal IDE, like `code .`
 set -e
 
 # Resolve through symlinks (e.g. /usr/local/bin/clide) to the real script dir.
