@@ -7,11 +7,16 @@ const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFile, spawn } = require('child_process');
 const { StateStore } = require('./src/main/state-store');
+const { DispatchCoordinator } = require('./src/main/dispatch-coordinator');
 const { autoUpdater } = require('electron-updater');
 const { provider, availability } = require('./src/main/providers');
 const { changedPathMap } = require('./src/main/overlap');
+const { normalizeClaim, claimOverlaps } = require('./src/main/path-claims');
+const { probePort, allocateAvailablePort } = require('./src/main/port-manager');
+const { resizePtySession } = require('./src/main/pty-lifecycle');
 const supervisor = require('./src/main/process-supervisor');
 const { text, taskSlug, isWithin, validHttpUrl } = require('./src/shared/validation');
+const { normalizeWorkspaceContext, workerContextPrompt } = require('./src/shared/workspace-context');
 
 const EXPLICIT_CWD = Boolean(process.env.CLIDE_CWD);
 let CWD = process.env.CLIDE_CWD || process.cwd();
@@ -23,6 +28,11 @@ const PROJECTS = path.join(os.homedir(), '.claude', 'projects');
 const CLIDE_HOME = path.resolve(process.env.CLIDE_DATA_DIR || path.join(os.homedir(), '.clide'));
 const STATE_FILE = path.join(CLIDE_HOME, 'state.db');
 const store = new StateStore(STATE_FILE, { legacyFile: path.join(CLIDE_HOME, 'state.json') });
+const dispatchCoordinator = new DispatchCoordinator(store);
+
+function wakeDispatchScheduler(workspaceRoot) {
+  for (const item of dispatchCoordinator.pending(workspaceRoot)) if (!item.blockedBy.length) send('orchestrator-dispatch', { taskId: item.task.id });
+}
 const allowedRoots = new Set([CWD]);
 for (const root of Object.keys(store.state.workspaces || {})) allowedRoots.add(path.resolve(root));
 for (const task of Object.values(store.state.tasks || {})) {
@@ -30,6 +40,7 @@ for (const task of Object.values(store.state.tasks || {})) {
   if (task.worktree) allowedRoots.add(path.resolve(task.worktree));
 }
 const sessions = new Map();
+const agentSessionStarts = new Map();
 const IMG_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg']);
 const CODE_EXT = new Set(['.js', '.ts', '.tsx', '.jsx', '.py', '.json', '.html', '.css', '.sh', '.yml', '.yaml', '.toml', '.rs', '.go']);
 const MIME = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml' };
@@ -107,6 +118,7 @@ function createWindow() {
   });
   win.webContents.session.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
   win.webContents.on('will-navigate', event => event.preventDefault());
+  win.webContents.on('did-start-loading', () => dispatchCoordinator.releaseLeases('renderer:'));
   win.webContents.on('render-process-gone', (_event, details) => logCrash('renderer', details));
   win.on('closed', () => { win = null; });
   return win;
@@ -175,7 +187,9 @@ async function providerArgs(adapter, resumeId, taskId, role = 'worker', workspac
     const hooks = Object.fromEntries(hookEvents.map(name => [name, [{ hooks: [handler] }]]));
     await fsp.writeFile(settings, JSON.stringify({ hooks }, null, 2), { mode: 0o600 });
     args.push('--settings', settings);
+    if (role === 'orchestrator') args.unshift('--permission-mode', 'plan', '--append-system-prompt', 'You are the repository orchestrator. Coordinate through Clide MCP, inspect repository state, and request explicit user approval before any repository write. Delegate implementation to isolated workers.');
   } else {
+    if (role === 'orchestrator') args.unshift('--sandbox', 'read-only', '--ask-for-approval', 'on-request');
     args.push('-c', 'mcp_servers.clide.command="node"');
     args.push('-c', `mcp_servers.clide.args=${JSON.stringify([server])}`);
     args.push('-c', `notify=${JSON.stringify([hook])}`);
@@ -316,7 +330,20 @@ function ingestAgentEvent(payload = {}) {
     send('attention', { taskId: task.id, state, event: eventEntry });
     if (Notification.isSupported()) new Notification({ title: `Clide · ${state}`, body: task.title }).show();
   }
+  if (state === 'done') wakeDispatchScheduler(task.repoRoot);
   return updated;
+}
+
+function markProviderReady(item, reason = 'Provider emitted terminal output') {
+  if (!item || !item.taskId) return null;
+  const task = store.snapshot().tasks[item.taskId];
+  if (!task || !task.dispatch || task.dispatch.stage !== 'launching') return task;
+  const result = dispatchCoordinator.transition(task.id, {
+    expected: 'launching', to: 'provider-ready', actor: `main:${item.persistentId}`,
+    reason, patch: { readyAt: new Date().toISOString() }
+  });
+  if (result.ok) send('dispatch-ready', { taskId: task.id, stage: 'provider-ready' });
+  return result.ok ? result.task : task;
 }
 
 function wirePty(key, proc) {
@@ -325,6 +352,23 @@ function wirePty(key, proc) {
     if (item) {
       item.lastOutput = (item.lastOutput + data).slice(-8000);
       if (item.kind === 'agent') {
+        if (item.awaitingPromptAck && item.awaitingPromptAck.armed && stripAnsi(data).trim()) {
+          const pending = item.awaitingPromptAck; item.awaitingPromptAck = null;
+          try {
+            const at = new Date().toISOString();
+            const acknowledged = dispatchCoordinator.transition(pending.taskId, {
+              leaseId: pending.leaseId, expected: 'provider-ready', to: 'prompt-delivered',
+              actor: `main:${item.persistentId}`, reason: 'Provider terminal emitted output after prompt write',
+              patch: { promptAcknowledgedAt: at }, taskPatch: { promptDeliveredAt: at }
+            });
+            if (acknowledged.ok) send('dispatch-prompt-ack', { taskId: pending.taskId, writeId: pending.writeId });
+          } catch {}
+        }
+        if (!item.providerOutputSeen && stripAnsi(data).trim()) {
+          item.providerOutputSeen = true;
+          clearTimeout(item.readyTimer);
+          item.readyTimer = setTimeout(() => markProviderReady(item), 150);
+        }
         const next = inferState(item.lastOutput);
         if (next !== item.state) {
           item.state = next;
@@ -340,10 +384,18 @@ function wirePty(key, proc) {
   });
   proc.onExit(({ exitCode, signal }) => {
     const item = sessions.get(key);
+    if (item) item.exited = true;
     if (item && item.kind === 'agent' && item.taskId && !shuttingDown && !item.explicitClose) {
       item.state = exitCode === 0 ? 'done' : 'exited';
       try { store.patchTask(item.taskId, { state: item.state }); } catch {}
       send('attention', { taskId: item.taskId, sessionKey: key, state: item.state });
+    }
+    if (item && item.kind === 'dev' && item.taskId) {
+      clearTimeout(item.healthTimer);
+      try {
+        const task = store.snapshot().tasks[item.taskId];
+        if (task) store.patchTask(item.taskId, { dev: { ...(task.dev || {}), status: item.explicitClose ? 'stopped' : 'crashed', lastCheckedAt: new Date().toISOString(), lastError: item.explicitClose ? '' : `Dev process exited with code ${exitCode}` } });
+      } catch {}
     }
     send('session-exit', { key, exitCode, signal });
   });
@@ -357,17 +409,36 @@ ipcMain.handle('welcome-file', () => {
 ipcMain.handle('install-os', () => runFile('/bin/bash', [path.join(__dirname, 'bin', 'setup-os')], { timeout: 60000 })
   .then(result => ({ ok: result.ok, output: `${result.out}${result.err}`.trim() })));
 ipcMain.handle('provider-availability', () => availability(cleanEnv()));
+ipcMain.handle('sessions-list', () => [...sessions.entries()].filter(([, item]) => item.kind === 'agent').map(([key, item]) => ({
+  key, cwd: item.cwd, provider: item.provider, taskId: item.taskId, persistentId: item.persistentId,
+  role: item.role, workspaceRoot: item.workspaceRoot,
+  shells: [...sessions.entries()].filter(([, shell]) => shell.parentKey === key).map(([, shell]) => ({ persistentId: shell.persistentId, kind: shell.kind, title: shell.kind === 'dev' ? 'Dev server' : 'Shell' }))
+})));
 
-ipcMain.handle('session-start', async (_event, payload = {}) => {
+async function startAgentSession(payload = {}) {
   const cwd = requireRoot(payload.cwd);
   const role = payload.role === 'orchestrator' ? 'orchestrator' : (payload.role === 'ad-hoc' ? 'ad-hoc' : 'worker');
   const workspaceRoot = await canonicalRepoRoot(cwd);
   allowedRoots.add(workspaceRoot);
   if (role === 'orchestrator') {
     const duplicate = [...sessions.values()].find(item => item.role === 'orchestrator' && item.workspaceRoot === workspaceRoot);
-    if (duplicate) return { error: 'This repository already has an active orchestrator session.', existingKey: duplicate.key };
+    if (duplicate) return {
+      key: duplicate.key, cwd: duplicate.cwd, repo: path.basename(duplicate.cwd), provider: duplicate.provider,
+      taskId: null, persistentId: duplicate.persistentId, recovered: true, reused: true,
+      role: duplicate.role, workspaceRoot: duplicate.workspaceRoot
+    };
   }
   const requestedTask = payload.taskId && store.state.tasks[payload.taskId];
+  const duplicateTaskSession = requestedTask && [...sessions.values()].find(item => item.kind === 'agent' && item.taskId === requestedTask.id);
+  if (duplicateTaskSession) {
+    if (requestedTask.dispatch && requestedTask.dispatch.stage === 'launching') markProviderReady(duplicateTaskSession, 'Reused an already-running provider session');
+    return {
+      key: duplicateTaskSession.key, cwd: duplicateTaskSession.cwd, repo: path.basename(duplicateTaskSession.cwd),
+      provider: duplicateTaskSession.provider, taskId: duplicateTaskSession.taskId,
+      persistentId: duplicateTaskSession.persistentId, recovered: true, reused: true,
+      role: duplicateTaskSession.role, workspaceRoot: duplicateTaskSession.workspaceRoot
+    };
+  }
   if (requestedTask && !payload.ignoreDependencies) {
     const blockedBy = (requestedTask.dependencies || []).filter(id => {
       const dependency = store.state.tasks[id];
@@ -382,6 +453,7 @@ ipcMain.handle('session-start', async (_event, payload = {}) => {
   const persistentId = text(payload.persistentId, 120) || `${payload.taskId || adapter.id}-${crypto.randomUUID()}`;
   let proc, supervised;
   try {
+    if (payload.recoverOnly && !await supervisor.exists(persistentId)) return { error: 'The supervised provider session is no longer running.' };
     const env = ptyEnv(key, null, payload.taskId, persistentId, persistentId, adapter.id, role, workspaceRoot);
     supervised = await supervisor.start({ id: persistentId, command: adapter.command, args: await providerArgs(adapter, payload.resumeId, payload.taskId, role, workspaceRoot), cwd, env });
     proc = supervisor.attach(supervised.name, { cwd, env, cols: 120, rows: 32 });
@@ -390,15 +462,36 @@ ipcMain.handle('session-start', async (_event, payload = {}) => {
     pty: proc, cwd, kind: 'agent', parentKey: null, provider: adapter.id,
     taskId: text(payload.taskId, 80) || null, transcriptId: text(payload.resumeId, 200) || null,
     preFiles, lastOutput: '', state: supervised.recovered ? 'running' : 'starting', startedAt: Date.now(),
-    persistentId, supervisorName: supervised.name, recovered: supervised.recovered, role, workspaceRoot
+    persistentId, supervisorName: supervised.name, recovered: supervised.recovered, role, workspaceRoot,
+    providerOutputSeen: false, readyTimer: null, exited: false
   });
   wirePty(key, proc);
   recordMetric(`sessions.${adapter.id}`);
   if (payload.taskId) {
-    try { store.patchTask(payload.taskId, { state: 'running', worktree: cwd, provider: adapter.id, supervisorId: persistentId }); } catch {}
+    try {
+      const task = store.patchTask(payload.taskId, { state: 'starting', worktree: cwd, provider: adapter.id, supervisorId: persistentId });
+      if (task.dispatch && task.dispatch.stage === 'launching') {
+        dispatchCoordinator.transition(task.id, {
+          expected: 'launching', to: 'launching', actor: `main:${persistentId}`,
+          reason: supervised.recovered ? 'Reattached supervised provider process' : 'Provider process attached; waiting for output',
+          patch: { launchedAt: task.dispatch.launchedAt || new Date().toISOString() }
+        });
+        if (supervised.recovered) markProviderReady(sessions.get(key), 'Reattached an existing supervised provider process');
+      }
+    } catch {}
   }
   if (role === 'orchestrator') store.upsertWorkspace(workspaceRoot, { repo: path.basename(workspaceRoot), orchestrator: { provider: adapter.id, persistentId, updatedAt: new Date().toISOString() } });
   return { key, cwd, repo: path.basename(cwd), provider: adapter.id, taskId: payload.taskId || null, persistentId, recovered: supervised.recovered, role, workspaceRoot };
+}
+
+ipcMain.handle('session-start', async (_event, payload = {}) => {
+  const role = payload.role === 'orchestrator' ? 'orchestrator' : (payload.role === 'ad-hoc' ? 'ad-hoc' : 'worker');
+  const identity = payload.taskId ? `task:${text(payload.taskId, 80)}` : (role === 'orchestrator' ? `orchestrator:${path.resolve(String(payload.cwd || ''))}` : (payload.persistentId ? `session:${text(payload.persistentId, 120)}` : null));
+  if (identity && agentSessionStarts.has(identity)) return await agentSessionStarts.get(identity);
+  const pending = startAgentSession(payload);
+  if (identity) agentSessionStarts.set(identity, pending);
+  try { return await pending; }
+  finally { if (identity && agentSessionStarts.get(identity) === pending) agentSessionStarts.delete(identity); }
 });
 
 ipcMain.handle('terminal-start', async (_event, payload = {}) => {
@@ -407,32 +500,65 @@ ipcMain.handle('terminal-start', async (_event, payload = {}) => {
   if (path.resolve(payload.cwd) !== path.resolve(owner.cwd)) return { error: 'Shell must use its task worktree.' };
   const key = `T${++terminalSeq}`;
   const shellPath = process.env.SHELL || '/bin/zsh';
-  const persistentId = text(payload.persistentId, 120) || `shell-${owner.taskId || owner.persistentId}-${crypto.randomUUID()}`;
+  const kind = payload.kind === 'dev' ? 'dev' : 'shell';
+  const persistentId = text(payload.persistentId, 120) || (kind === 'dev' && owner.taskId ? `dev-${owner.taskId}` : `shell-${owner.taskId || owner.persistentId}-${crypto.randomUUID()}`);
+  const duplicateTerminal = [...sessions.entries()].find(([, item]) => item.parentKey === payload.parentKey && item.persistentId === persistentId);
+  if (duplicateTerminal) return { key: duplicateTerminal[0], cwd: owner.cwd, shell: path.basename(process.env.SHELL || '/bin/zsh'), persistentId, recovered: true, reused: true, kind: duplicateTerminal[1].kind };
   let proc, supervised;
   try {
     const env = ptyEnv(key, owner.key, owner.taskId, owner.persistentId, persistentId, 'shell', owner.role, owner.workspaceRoot);
     supervised = await supervisor.start({ id: persistentId, command: shellPath, args: ['-l'], cwd: owner.cwd, env });
     proc = supervisor.attach(supervised.name, { cwd: owner.cwd, env, cols: 120, rows: 32 });
   } catch (error) { return { error: error.message }; }
-  sessions.set(key, { pty: proc, cwd: owner.cwd, kind: 'shell', parentKey: payload.parentKey, taskId: owner.taskId, lastOutput: '', persistentId, supervisorName: supervised.name, recovered: supervised.recovered });
+  sessions.set(key, { pty: proc, cwd: owner.cwd, kind, parentKey: payload.parentKey, taskId: owner.taskId, lastOutput: '', persistentId, supervisorName: supervised.name, recovered: supervised.recovered, healthTimer: null, exited: false });
   wirePty(key, proc);
-  return { key, cwd: owner.cwd, shell: path.basename(shellPath), persistentId, recovered: supervised.recovered };
+  if (kind === 'dev' && owner.taskId) {
+    try {
+      const task = store.snapshot().tasks[owner.taskId];
+      if (task) store.patchTask(task.id, { dev: { ...(task.dev || {}), status: 'starting', terminalId: persistentId, startedAt: new Date().toISOString(), url: task.port ? `http://127.0.0.1:${task.port}` : '' } });
+    } catch {}
+  }
+  return { key, cwd: owner.cwd, shell: path.basename(shellPath), persistentId, recovered: supervised.recovered, kind };
 });
+
+async function monitorDevSession(item) {
+  if (!item || item.kind !== 'dev' || !item.taskId || shuttingDown) return;
+  const task = store.snapshot().tasks[item.taskId];
+  if (!task || !task.port) return;
+  const healthy = await probePort(task.port);
+  const previous = task.dev || {};
+  const now = new Date().toISOString();
+  const elapsed = Date.now() - new Date(previous.startedAt || now).getTime();
+  const status = healthy ? 'healthy' : (previous.status === 'healthy' || elapsed > 30_000 ? 'unhealthy' : 'starting');
+  store.patchTask(task.id, { dev: {
+    ...previous, status, lastCheckedAt: now,
+    healthyAt: healthy ? (previous.healthyAt || now) : previous.healthyAt,
+    lastError: healthy ? '' : (status === 'unhealthy' ? `Nothing is listening on port ${task.port}.` : '')
+  } });
+  send('dev-health', { taskId: task.id, port: task.port, status });
+  item.healthTimer = setTimeout(() => monitorDevSession(item), healthy ? 5000 : 1000);
+}
 
 ipcMain.on('session-input', (_event, payload = {}) => {
   const item = sessions.get(payload.key);
-  if (item && typeof payload.data === 'string' && payload.data.length <= 1024 * 1024) item.pty.write(payload.data);
+  if (item && typeof payload.data === 'string' && payload.data.length <= 1024 * 1024) {
+    item.pty.write(payload.data);
+    if (item.kind === 'dev' && !item.healthTimer) item.healthTimer = setTimeout(() => monitorDevSession(item), 300);
+  }
 });
 ipcMain.on('session-resize', (_event, payload = {}) => {
   const item = sessions.get(payload.key);
   const cols = Math.max(2, Math.min(500, Number(payload.cols) || 0));
   const rows = Math.max(1, Math.min(300, Number(payload.rows) || 0));
-  if (item && cols && rows) item.pty.resize(cols, rows);
+  if (item && cols && rows) {
+    resizePtySession(item, cols, rows, error => console.warn(`PTY resize failed for ${payload.key}:`, error.message));
+  }
 });
 ipcMain.on('session-kill', (_event, payload = {}) => {
   const item = sessions.get(payload.key);
   if (!item) return;
   item.explicitClose = true;
+  item.exited = true;
   supervisor.terminate(item.supervisorName).catch(() => {});
   try { item.pty.kill(); } catch {}
   sessions.delete(payload.key);
@@ -569,7 +695,91 @@ async function gitStatus(cwd) {
   return { repo: result.ok, branch, ahead, behind, files };
 }
 
+async function gitDiffSummary(cwd, status = null) {
+  status = status || await gitStatus(cwd);
+  if (!status.repo) return { repo: false, branch: '', files: 0, additions: 0, deletions: 0, ahead: 0, behind: 0 };
+  let result = await runGit(cwd, ['diff', '--numstat', 'HEAD', '--']);
+  if (!result.ok) result = await runGit(cwd, ['diff', '--numstat', '--']);
+  let additions = 0;
+  let deletions = 0;
+  for (const line of result.out.split('\n')) {
+    if (!line.trim()) continue;
+    const [added, deleted] = line.split('\t');
+    if (/^\d+$/.test(added)) additions += Number(added);
+    if (/^\d+$/.test(deleted)) deletions += Number(deleted);
+  }
+  return {
+    repo: true,
+    branch: status.branch,
+    files: status.files.length,
+    additions,
+    deletions,
+    ahead: status.ahead,
+    behind: status.behind
+  };
+}
+
 ipcMain.handle('git-status', (_event, payload = {}) => gitStatus(requireRoot(payload.cwd)));
+ipcMain.handle('git-diff-summary', async (_event, payload = {}) => {
+  const cwd = requireRoot(payload.cwd);
+  const status = await gitStatus(cwd);
+  return gitDiffSummary(cwd, status);
+});
+ipcMain.handle('git-pr-preview', async (_event, payload = {}) => {
+  const cwd = requireRoot(payload.cwd);
+  const status = await gitStatus(cwd);
+  if (!status.repo) return { ok: false, available: false, err: 'Open a Git repository to create a pull request.' };
+  const branch = status.branch || '';
+  if (!branch || branch === 'HEAD') return { ok: false, available: false, err: 'Check out a branch before creating a pull request.' };
+  const gh = await runFile('gh', ['--version'], { cwd, timeout: 5000 });
+  let base = text(payload.base, 240);
+  if (base) {
+    const valid = await runGit(cwd, ['check-ref-format', '--branch', base]);
+    if (!valid.ok) return { ok: false, available: gh.ok, err: 'The base branch name is invalid.' };
+  } else {
+    const remoteHead = await runGit(cwd, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+    base = remoteHead.ok ? remoteHead.out.trim().replace(/^origin\//, '') : 'main';
+  }
+  const remoteBase = `refs/remotes/origin/${base}`;
+  const localBase = `refs/heads/${base}`;
+  const remoteExists = await runGit(cwd, ['rev-parse', '--verify', '--quiet', remoteBase]);
+  const compareRef = remoteExists.ok ? remoteBase : localBase;
+  const commits = await runGit(cwd, ['log', '--format=%s', '--max-count=20', `${compareRef}..HEAD`]);
+  const upstream = await runGit(cwd, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']);
+  const summary = await gitDiffSummary(cwd, status);
+  return {
+    ok: true,
+    available: gh.ok,
+    ghError: gh.ok ? '' : 'GitHub CLI (gh) is not installed or is not available in your login PATH.',
+    branch,
+    base,
+    upstream: upstream.ok ? upstream.out.trim() : '',
+    commits: commits.ok ? commits.out.split('\n').map(value => value.trim()).filter(Boolean) : [],
+    ...summary
+  };
+});
+ipcMain.handle('git-pr-create', async (_event, payload = {}) => {
+  const cwd = requireRoot(payload.cwd);
+  const title = text(payload.title, 240);
+  const body = text(payload.body, 10000);
+  const base = text(payload.base, 240);
+  if (!title) return { ok: false, err: 'A pull request title is required.' };
+  const validBase = await runGit(cwd, ['check-ref-format', '--branch', base]);
+  if (!base || !validBase.ok) return { ok: false, err: 'The base branch name is invalid.' };
+  const branch = (await runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])).out.trim();
+  if (!branch || branch === 'HEAD') return { ok: false, err: 'Check out a branch before creating a pull request.' };
+  const upstream = await runGit(cwd, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']);
+  if (!upstream.ok) return { ok: false, err: 'Push this branch before creating the pull request. Clide never pushes implicitly.' };
+  const result = await runFile('gh', [
+    'pr', 'create',
+    '--title', title,
+    '--body', body,
+    '--base', base,
+    '--head', branch
+  ], { cwd, timeout: 120000 });
+  const url = result.ok ? result.out.split(/\s+/).find(value => /^https:\/\/github\.com\//.test(value)) || '' : '';
+  return { ...result, branch, base, url };
+});
 ipcMain.handle('git-diff', async (_event, payload = {}) => {
   const cwd = requireRoot(payload.cwd);
   const file = text(payload.file, 4096);
@@ -605,11 +815,7 @@ ipcMain.handle('git-commit', (_event, payload = {}) => runGit(requireRoot(payloa
 ipcMain.handle('git-push', (_event, payload = {}) => runGit(requireRoot(payload.cwd), ['push']));
 ipcMain.handle('git-log-summary', (_event, payload = {}) => runGit(requireRoot(payload.cwd), ['log', '--oneline', '--decorate', '-20']));
 
-function allocatePort() {
-  const used = new Set(Object.values(store.state.tasks).map(task => task.port).filter(Number.isInteger));
-  for (let port = 4100; port < 5000; port++) if (!used.has(port)) return port;
-  return null;
-}
+async function allocatePort() { return allocateAvailablePort(store.snapshot().tasks); }
 
 async function copyWorktreeIncludes(source, target) {
   const config = path.join(source, '.worktreeinclude');
@@ -637,6 +843,13 @@ async function createWorktree(payload = {}) {
   const commonResult = await runGit(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
   const commonDir = commonResult.ok ? commonResult.out.trim() : path.join(root, '.git');
   const canonicalRepo = path.basename(commonDir) === '.git' ? path.dirname(commonDir) : commonDir;
+  if (payload.dispatch) {
+    payload.taskId = text(payload.taskId, 80) || `task-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    try {
+      payload.dependencies = dispatchCoordinator.resolveDependencies(payload.dependencies, canonicalRepo);
+      dispatchCoordinator.assertNoCycle(payload.taskId, payload.dependencies);
+    } catch (error) { return { ok: false, err: error.message }; }
+  }
   const slug = taskSlug(payload.taskName || payload.title);
   if (!slug) return { ok: false, err: 'Enter a task name.' };
   const branch = text(payload.branch, 240) || `clide/${slug}`;
@@ -644,6 +857,13 @@ async function createWorktree(payload = {}) {
   if (!valid.ok) return { ok: false, err: valid.err || 'Invalid branch name.' };
   const existing = Object.values(store.state.tasks).find(task => task.id !== payload.taskId && task.branch === branch && task.state !== 'archived');
   if (existing) return { ok: false, err: `Branch is already owned by “${existing.title}”.` };
+  let declaredClaims = [];
+  try { declaredClaims = Array.isArray(payload.pathClaims) ? payload.pathClaims.map(normalizeClaim) : []; }
+  catch (error) { return { ok: false, err: error.message }; }
+  const port = await allocatePort();
+  if (!port) return { ok: false, err: 'No available dev port was found between 4100 and 4999.' };
+  const contextSnapshot = payload.dispatch ? (payload.contextSnapshot || workerContextPrompt((store.state.workspaces[canonicalRepo] || {}).context)) : '';
+  const launchPrompt = payload.dispatch && contextSnapshot && !payload.contextSnapshot ? [contextSnapshot, payload.launchPrompt].filter(Boolean).join('\n\n---\n\n') : payload.launchPrompt;
   const repoName = path.basename(canonicalRepo);
   const repoId = `${repoName}-${crypto.createHash('sha1').update(canonicalRepo).digest('hex').slice(0, 8)}`;
   const target = path.join(CLIDE_HOME, 'worktrees', repoId, slug);
@@ -658,9 +878,11 @@ async function createWorktree(payload = {}) {
     id: payload.taskId, title: payload.taskName || payload.title, ticket: payload.ticket,
     provider: payload.provider, state: 'draft', repo: repoName, repoRoot: canonicalRepo,
     worktree: target, branch, baseRef, setupCommand: payload.setupCommand,
-    devCommand: payload.devCommand, port: allocatePort(), dependencies: payload.dependencies,
-    launchPrompt: payload.launchPrompt, createdBy: payload.createdBy, dispatchKey: payload.dispatchKey,
-    pathClaims: Array.isArray(payload.pathClaims) ? payload.pathClaims.map(value => ({ id: crypto.randomUUID(), path: text(value, 4096), note: 'Declared at dispatch', from: payload.createdBy || 'user', at: new Date().toISOString() })).filter(item => item.path) : []
+    devCommand: payload.devCommand, port, dependencies: payload.dependencies,
+    launchPrompt, createdBy: payload.createdBy, dispatchKey: payload.dispatchKey,
+    contextSnapshot,
+    dispatch: payload.dispatch,
+    pathClaims: declaredClaims.map(value => ({ id: crypto.randomUUID(), path: value, note: 'Declared at dispatch', from: payload.createdBy || 'user', at: new Date().toISOString() }))
   });
   store.upsertWorkspace(canonicalRepo, { repo: repoName });
   recordMetric('worktrees.created');
@@ -680,21 +902,29 @@ async function dispatchFromOrchestrator(envelope = {}) {
   store.load();
   const dispatchKey = text(input.dispatchKey || input.ticket, 160);
   const existing = dispatchKey && Object.values(store.state.tasks).find(task => task.repoRoot === requestedRoot && task.dispatchKey === dispatchKey && task.state !== 'archived');
-  if (existing) return { ok: true, existing: true, task: existing, cwd: existing.worktree, port: existing.port, launched: [...sessions.values()].some(item => item.taskId === existing.id) };
+  if (existing) {
+    const launched = [...sessions.values()].some(item => item.taskId === existing.id) || (existing.dispatch && existing.dispatch.stage === 'running');
+    if (!launched && existing.dispatch) send('orchestrator-dispatch', { taskId: existing.id });
+    return { ok: true, existing: true, task: existing, cwd: existing.worktree, port: existing.port, launched };
+  }
   const providerId = input.provider === 'codex' ? 'codex' : 'claude';
   const providers = await availability(cleanEnv());
   if (!providers[providerId]) throw new Error(`${providerId === 'codex' ? 'Codex' : 'Claude'} is not available on the login-shell PATH.`);
+  const taskId = text(input.taskId, 80) || `task-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+  const dependencies = dispatchCoordinator.resolveDependencies(input.dependencies, requestedRoot);
+  dispatchCoordinator.assertNoCycle(taskId, dependencies);
   const result = await createWorktree({
-    cwd: requestedRoot, taskName: input.title, ticket: input.ticket, provider: providerId,
+    cwd: requestedRoot, taskId, taskName: input.title, ticket: input.ticket, provider: providerId,
     branch: input.branch, baseRef: input.baseRef || 'HEAD', setupCommand: input.setupCommand,
-    devCommand: input.devCommand, dependencies: input.dependencies, launchPrompt: input.prompt,
-    pathClaims: input.pathClaims, dispatchKey, createdBy: `orchestrator:${owner.persistentId}`
+    devCommand: input.devCommand, dependencies, launchPrompt: input.prompt,
+    pathClaims: input.pathClaims, dispatchKey, createdBy: `orchestrator:${owner.persistentId}`,
+    dispatch: { stage: 'worktree-created', requestedAt: new Date().toISOString(), lastActor: `orchestrator:${owner.persistentId}` }
   });
   if (!result.ok) return result;
   store.load();
   const blockedBy = (result.task.dependencies || []).filter(id => store.state.tasks[id] && !['done', 'archived'].includes(store.state.tasks[id].state));
   const launch = blockedBy.length === 0;
-  if (launch) send('orchestrator-dispatch', { ...result, prompt: result.task.launchPrompt, provider: providerId, orchestratorKey: owner.key });
+  if (launch) send('orchestrator-dispatch', { taskId: result.task.id });
   recordMetric('orchestrator.dispatched');
   return { ...result, launched: launch, blockedBy };
 }
@@ -728,7 +958,7 @@ ipcMain.handle('review-task-create', async (_event, payload = {}) => {
   const task = store.upsertTask({
     title: `Review · ${source.title}`, ticket: source.ticket, provider: reviewer, state: 'draft', repo: source.repo,
     repoRoot: source.repoRoot, worktree: target, branch, baseRef: source.branch, reviewOf: source.id,
-    dependencies: [], launchPrompt: prompt, port: allocatePort()
+    dependencies: [], launchPrompt: prompt, port: await allocatePort()
   });
   return { ok: true, task, cwd: target, provider: reviewer, prompt };
 });
@@ -758,7 +988,7 @@ ipcMain.handle('integration-worktree-create', async (_event, payload = {}) => {
     merged.push(task.branch);
   }
   const prompt = `Validate the combined integration branch containing: ${merged.join(', ')}. Run end-to-end checks and report cross-feature regressions through Clide.`;
-  const integration = store.upsertTask({ title: `Integration · ${tasks.map(item => item.ticket || item.title).join(' + ')}`, provider: payload.provider, state: 'draft', repo: tasks[0].repo, repoRoot, worktree: target, branch, baseRef, integrationOf: ids, launchPrompt: prompt, port: allocatePort() });
+  const integration = store.upsertTask({ title: `Integration · ${tasks.map(item => item.ticket || item.title).join(' + ')}`, provider: payload.provider, state: 'draft', repo: tasks[0].repo, repoRoot, worktree: target, branch, baseRef, integrationOf: ids, launchPrompt: prompt, port: await allocatePort() });
   return { ok: true, task: integration, cwd: target, provider: integration.provider, prompt, merged };
 });
 
@@ -892,17 +1122,90 @@ ipcMain.handle('state-snapshot', async () => {
     task.git = status;
     return { taskId: task.id, files: status.files || [] };
   }));
-  const claims = new Map();
-  for (const task of Object.values(snapshot.tasks)) for (const claim of task.pathClaims || []) {
-    const key = claim.path; if (!claims.has(key)) claims.set(key, []); claims.get(key).push(task.id);
-  }
-  const claimOverlaps = [...claims].filter(([, ids]) => new Set(ids).size > 1).map(([path, ids]) => ({ path, taskIds: [...new Set(ids)], source: 'claim' }));
   for (const task of Object.values(snapshot.tasks)) task.blockedBy = (task.dependencies || []).filter(id => snapshot.tasks[id] && !['done', 'archived'].includes(snapshot.tasks[id].state));
-  return { ...snapshot, overlaps: [...changedPathMap(taskStatuses), ...claimOverlaps], stateFile: STATE_FILE };
+  return { ...snapshot, overlaps: [...changedPathMap(taskStatuses), ...claimOverlaps(snapshot.tasks)], stateFile: STATE_FILE };
 });
 ipcMain.handle('task-upsert', (_event, payload) => store.upsertTask(payload));
-ipcMain.handle('task-patch', (_event, payload = {}) => store.patchTask(text(payload.id, 80), payload.patch || {}));
+ipcMain.handle('task-patch', (_event, payload = {}) => {
+  const task = store.patchTask(text(payload.id, 80), payload.patch || {});
+  if (task.state === 'done' || task.state === 'archived') wakeDispatchScheduler(task.repoRoot);
+  return task;
+});
 ipcMain.handle('task-remove', (_event, payload = {}) => store.removeTask(text(payload.id, 80)));
+ipcMain.handle('dispatch-pending', (_event, payload = {}) => dispatchCoordinator.pending(text(payload.workspaceRoot, 4096) || null));
+ipcMain.handle('dispatch-claim', (_event, payload = {}) => dispatchCoordinator.claim(text(payload.taskId, 80), text(payload.owner, 160) || 'renderer'));
+ipcMain.handle('dispatch-transition', (_event, payload = {}) => dispatchCoordinator.transition(text(payload.taskId, 80), payload));
+ipcMain.handle('dispatch-wait-ready', async (_event, payload = {}) => {
+  const taskId = text(payload.taskId, 80);
+  const timeout = Math.max(1000, Math.min(120000, Number(payload.timeout) || 45000));
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    const task = store.snapshot().tasks[taskId];
+    if (!task || !task.dispatch) return { ok: false, error: 'Durable dispatch not found.' };
+    if (['provider-ready', 'prompt-delivered', 'running'].includes(task.dispatch.stage)) return { ok: true, task, stage: task.dispatch.stage };
+    if (['failed', 'blocked', 'cancelled'].includes(task.dispatch.stage)) return { ok: false, task, stage: task.dispatch.stage, error: task.dispatch.lastError || `Dispatch entered ${task.dispatch.stage}.` };
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  return { ok: false, stage: 'launching', error: 'Provider did not become ready before the 45 second timeout.' };
+});
+ipcMain.handle('dispatch-prompt-send', (_event, payload = {}) => {
+  const taskId = text(payload.taskId, 80);
+  const item = sessions.get(payload.sessionKey) || [...sessions.values()].find(session => session.kind === 'agent' && session.taskId === taskId);
+  const task = store.snapshot().tasks[taskId];
+  if (!item || item.kind !== 'agent' || item.taskId !== taskId) return { ok: false, error: `Worker session is not attached for task ${taskId}.` };
+  if (!task || !task.dispatch || task.dispatch.stage !== 'provider-ready') return { ok: false, error: `Worker is not ready for a prompt (${task && task.dispatch ? task.dispatch.stage : 'missing'}).` };
+  if (task.dispatch.promptWriteId && !task.dispatch.promptAcknowledgedAt) return { ok: false, uncertain: true, error: 'A previous prompt write is awaiting confirmation.' };
+  const body = String(payload.prompt || '').trim(); if (!body) return { ok: false, error: 'Worker prompt is empty.' };
+  const writeId = crypto.randomUUID(); const at = new Date().toISOString();
+  const recorded = dispatchCoordinator.transition(taskId, {
+    leaseId: payload.leaseId, expected: 'provider-ready', to: 'provider-ready', actor: payload.actor || 'renderer',
+    reason: 'Recorded prompt write before terminal delivery', patch: { promptWriteId: writeId, promptWrittenAt: at }
+  });
+  if (!recorded.ok) return recorded;
+  item.awaitingPromptAck = { taskId, writeId, leaseId: payload.leaseId, armed: true };
+  item.pty.write(`${body}\r`);
+  return { ok: true, writeId, writtenAt: at };
+});
+ipcMain.handle('dispatch-session-ready', (_event, payload = {}) => {
+  const taskId = text(payload.taskId, 80);
+  const item = sessions.get(payload.sessionKey) || [...sessions.values()].find(session => session.kind === 'agent' && session.taskId === taskId);
+  if (!item || item.kind !== 'agent' || item.taskId !== taskId) return { ok: false, error: 'Worker session is not attached.' };
+  const task = markProviderReady(item, 'Renderer reattached an already-running provider session');
+  return { ok: Boolean(task && task.dispatch && ['provider-ready', 'prompt-delivered', 'running'].includes(task.dispatch.stage)), task };
+});
+ipcMain.handle('dispatch-wait-prompt', async (_event, payload = {}) => {
+  const taskId = text(payload.taskId, 80); const timeout = Math.max(1000, Math.min(30000, Number(payload.timeout) || 10000)); const started = Date.now();
+  while (Date.now() - started < timeout) {
+    const task = store.snapshot().tasks[taskId];
+    if (!task || !task.dispatch) return { ok: false, error: 'Durable dispatch not found.' };
+    if (['prompt-delivered', 'running'].includes(task.dispatch.stage)) return { ok: true, task };
+    if (['failed', 'cancelled'].includes(task.dispatch.stage)) return { ok: false, error: task.dispatch.lastError || `Dispatch entered ${task.dispatch.stage}.` };
+    await new Promise(resolve => setTimeout(resolve, 75));
+  }
+  return { ok: false, uncertain: true, error: 'Prompt was written, but the provider terminal did not confirm output.' };
+});
+ipcMain.handle('dispatch-fail', (_event, payload = {}) => dispatchCoordinator.fail(text(payload.taskId, 80), payload));
+ipcMain.handle('dispatch-retry', (_event, payload = {}) => {
+  const result = dispatchCoordinator.retry(text(payload.taskId, 80), 'user');
+  if (result.ok) send('orchestrator-dispatch', { taskId: payload.taskId });
+  return result;
+});
+ipcMain.handle('dispatch-cancel', (_event, payload = {}) => dispatchCoordinator.cancel(text(payload.taskId, 80), 'user'));
+ipcMain.handle('workspace-context-get', (_event, payload = {}) => {
+  const root = requireRoot(payload.root);
+  return normalizeWorkspaceContext((store.snapshot().workspaces[root] || {}).context);
+});
+ipcMain.handle('workspace-context-set', (_event, payload = {}) => {
+  const root = requireRoot(payload.root); const current = (store.snapshot().workspaces[root] || {}).context || {};
+  const context = normalizeWorkspaceContext({ ...current, ...(payload.context || {}), updatedAt: new Date().toISOString(), updatedBy: 'user' });
+  return store.upsertWorkspace(root, { context }).context;
+});
+ipcMain.handle('approval-resolve', (_event, payload = {}) => {
+  const task = store.snapshot().tasks[text(payload.taskId, 80)]; if (!task) throw new Error('Task not found.');
+  const id = text(payload.approvalId, 120);
+  const approvals = (task.approvals || []).map(item => item.id === id ? { ...item, status: payload.approved ? 'approved' : 'rejected', resolvedAt: new Date().toISOString(), resolvedBy: 'user', note: text(payload.note, 1000) } : item);
+  return store.appendTaskAudit(task.id, { type: 'approval-resolved', actor: 'user', reason: `${payload.approved ? 'Approved' : 'Rejected'} ${id}` }, { approvals, state: payload.approved ? 'running' : 'blocked' });
+});
 ipcMain.handle('layout-set', (_event, payload = {}) => store.setLayout(text(payload.workspace, 4096), text(payload.layout, 40)));
 ipcMain.handle('view-state-get', () => store.state.settings.rendererState || null);
 ipcMain.handle('view-state-set', (_event, payload) => store.setSetting('rendererState', payload));
@@ -952,7 +1255,7 @@ ipcMain.handle('coord-publish', (_event, payload = {}) => {
   if (!task) throw new Error('Task not found.');
   const kind = payload.kind === 'finding' ? 'findings' : 'messages';
   const entry = { id: crypto.randomUUID(), body: text(payload.body, 8000), from: text(payload.from, 80) || 'user', at: new Date().toISOString(), level: text(payload.level, 20) || 'info' };
-  const updated = store.patchTask(task.id, { [kind]: [...task[kind], entry] });
+  const updated = store.appendTaskAudit(task.id, { type: kind === 'findings' ? 'finding-published' : 'message-published', actor: entry.from, reason: entry.body }, { [kind]: [...task[kind], entry] });
   send('attention', { taskId: task.id, state: kind === 'findings' ? 'finding' : 'message', entry });
   return updated;
 });
@@ -1004,12 +1307,14 @@ const shimServer = http.createServer((request, response) => {
 shimServer.on('error', error => console.error('shim server error:', error.message));
 
 async function start() {
-  await fsp.mkdir(CLIDE_HOME, { recursive: true });
+  await fsp.mkdir(CLIDE_HOME, { recursive: true, mode: 0o700 });
+  await fsp.chmod(CLIDE_HOME, 0o700);
   try { await fsp.unlink(SHIM_SOCKET); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   await new Promise((resolve, reject) => {
     shimServer.listen(SHIM_SOCKET, resolve);
     shimServer.once('error', reject);
   });
+  await fsp.chmod(SHIM_SOCKET, 0o600);
   createWindow();
   if (app.isPackaged && store.state.settings.autoUpdate !== false) setTimeout(() => autoUpdater.checkForUpdates().catch(() => {}), 12000);
 }
@@ -1019,6 +1324,7 @@ app.on('activate', createWindow);
 app.on('before-quit', () => {
   shuttingDown = true;
   for (const item of sessions.values()) {
+    item.exited = true;
     supervisor.detachSync(item.supervisorName);
     try { item.pty.kill(); } catch {}
   }

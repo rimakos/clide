@@ -10,6 +10,7 @@ const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'clide-orchestrator-'));
 const source = path.join(fixture, 'repo'); const data = path.join(fixture, 'data');
 const profile = path.join(fixture, 'profile'); const mockBin = path.join(fixture, 'bin');
 const port = 9700 + Math.floor(Math.random() * 200);
+let inspectPage = null;
 for (const dir of [source, data, profile, mockBin]) fs.mkdirSync(dir);
 for (const provider of ['claude', 'codex']) {
   const file = path.join(mockBin, provider);
@@ -33,7 +34,9 @@ async function main() {
   const page = await waitFor(async () => { try { return (await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()).find(item => item.title === 'Clide'); } catch { return null; } }, 'Electron page');
   const socket = new WebSocket(page.webSocketDebuggerUrl); await new Promise((resolve, reject) => { socket.onopen = resolve; socket.onerror = reject; });
   let seq = 0; const pending = new Map(); socket.onmessage = event => { const message = JSON.parse(event.data); if (!pending.has(message.id)) return; const item = pending.get(message.id); pending.delete(message.id); message.error ? item.reject(new Error(message.error.message)) : item.resolve(message.result); };
-  const evaluate = expression => new Promise((resolve, reject) => { const id = ++seq; pending.set(id, { resolve: result => result.exceptionDetails ? reject(new Error(result.exceptionDetails.text)) : resolve(result.result.value), reject }); socket.send(JSON.stringify({ id, method: 'Runtime.evaluate', params: { expression, awaitPromise: true, returnByValue: true } })); });
+  const command = (method, params = {}) => new Promise((resolve, reject) => { const id = ++seq; pending.set(id, { resolve, reject }); socket.send(JSON.stringify({ id, method, params })); });
+  const evaluate = expression => command('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }).then(result => result.exceptionDetails ? Promise.reject(new Error(result.exceptionDetails.text)) : result.result.value);
+  inspectPage = evaluate;
   await waitFor(() => evaluate(`Boolean(document.querySelector('.agent-tile.orchestrator'))`), 'orchestrator tile');
   const stateFile = path.join(data, 'state.db');
   const workspace = await waitFor(() => evaluate(`window.clide.ipc.invoke('state-snapshot').then(state => { const workspace = Object.values(state.workspaces).find(value => value.orchestrator); return workspace && workspace.orchestrator; })`), 'orchestrator persistence');
@@ -52,14 +55,24 @@ async function main() {
   if (responses[2].result.isError) throw new Error(`MCP dispatch error: ${responses[2].result.content[0].text}`);
   const dispatch = JSON.parse(responses[2].result.content[0].text);
   if (!dispatch.ok || dispatch.task.provider !== 'claude') throw new Error('Structured dispatch returned the wrong worker.');
-  await waitFor(() => evaluate(`document.querySelectorAll('.agent-tile').length === 2`), 'worker tile');
+  await command('Page.reload', { ignoreCache: true });
+  await delay(300);
+  await waitFor(() => evaluate(`document.readyState === 'complete'`), 'renderer recovery');
+  await waitFor(() => evaluate(`document.querySelectorAll('.agent-tile.orchestrator').length === 1 && document.querySelectorAll('.agent-tile.claude:not(.orchestrator)').length === 1`), 'one orchestrator and one worker tile');
   await waitFor(() => evaluate(`document.body.innerText.includes('ORCH-1')`), 'worker identity');
   await waitFor(() => evaluate(`document.querySelectorAll('.agent-tile.claude:not(.orchestrator)').length === 1`), 'Claude worker');
-  await waitFor(() => evaluate(`(() => { const tile = document.querySelector('.agent-tile.claude:not(.orchestrator)'); return tile && tile.textContent.includes('Implement the isolated orchestrator fixture'); })()`), 'worker prompt delivery');
+  await waitFor(() => evaluate(`window.clide.ipc.invoke('state-snapshot').then(state => { const task = state.tasks[${JSON.stringify(dispatch.task.id)}]; return task && task.dispatch && task.dispatch.stage === 'running' && Boolean(task.dispatch.promptAcknowledgedAt); })`), 'worker prompt acknowledgement');
+  await command('Page.reload', { ignoreCache: true });
+  await delay(300);
+  await waitFor(() => evaluate(`document.readyState === 'complete' && document.querySelectorAll('.agent-tile.orchestrator').length === 1 && document.querySelectorAll('.agent-tile.claude:not(.orchestrator)').length === 1`), 'running worker reattach');
+  if (!await evaluate(`document.querySelectorAll('.agent-tile.claude:not(.orchestrator)').length === 1`)) throw new Error('Renderer recovery did not preserve exactly one worker tile.');
   const second = runMcp(); const secondResponses = second.stdout.trim().split('\n').map(JSON.parse); const retry = JSON.parse(secondResponses[2].result.content[0].text);
   if (!retry.existing) throw new Error('Dispatch retry was not idempotent.');
   const snapshot = await evaluate(`window.clide.ipc.invoke('state-snapshot')`);
   if (Object.keys(snapshot.tasks).length !== 1 || snapshot.tasks[dispatch.task.id].createdBy.indexOf('orchestrator:') !== 0) throw new Error('Orchestrator task metadata is incomplete.');
+  const durable = snapshot.tasks[dispatch.task.id];
+  if (durable.dispatch.stage !== 'running' || !durable.dispatch.readyAt || !durable.dispatch.promptAcknowledgedAt || durable.audit.length < 4) throw new Error('Durable dispatch did not record readiness, prompt acknowledgement, and audit transitions.');
+  if ((fs.statSync(path.join(data, 'open.sock')).mode & 0o777) !== 0o600) throw new Error('Clide socket permissions are not private.');
   await evaluate(`(() => { const tile = document.querySelector('.agent-tile:not(.orchestrator)'); tile.querySelector('.tile-close').click(); })()`);
   await delay(300);
   const removed = await evaluate(`window.clide.ipc.invoke('git-worktree-remove', { taskId: ${JSON.stringify(dispatch.task.id)} })`);
@@ -67,8 +80,17 @@ async function main() {
   await evaluate(`window.clide.ipc.invoke('task-remove', { id: ${JSON.stringify(dispatch.task.id)} })`);
   await evaluate(`document.querySelector('.agent-tile.orchestrator').querySelector('.tile-close').click()`);
   await delay(300);
-  console.log(JSON.stringify({ ok: true, orchestrator: workspace.provider, worker: 'claude', pinned: true, dispatch: true, promptDelivered: true, idempotent: true, repositoryScoped: true }));
+  console.log(JSON.stringify({ ok: true, orchestrator: workspace.provider, worker: 'claude', pinned: true, dispatch: true, promptDelivered: true, idempotent: true, repositoryScoped: true, rendererRecovery: true, exactlyOneWorker: true, privateSocket: true }));
   socket.close(); child.kill('SIGTERM');
 }
-main().catch(error => { console.error(error.stack || error.message); child.kill('SIGTERM'); process.exitCode = 1; });
+main().catch(async error => {
+  console.error(error.stack || error.message);
+  try { if (inspectPage) console.error('Renderer tile snapshot:', JSON.stringify(await inspectPage(`window.clide.ipc.invoke('sessions-list').then(live => ({ ready: document.readyState, live, saved: JSON.parse(localStorage.getItem('clide-state') || 'null'), tiles: [...document.querySelectorAll('.agent-tile')].map(tile => ({ key: tile.dataset.key, classes: tile.className, text: tile.innerText.slice(0, 180) })) }))`), null, 2)); } catch {}
+  try {
+    const failed = new StateStore(path.join(data, 'state.db'));
+    console.error('Durable dispatch snapshot:', JSON.stringify(Object.values(failed.state.tasks).map(task => ({ id: task.id, state: task.state, dispatch: task.dispatch, promptDeliveredAt: task.promptDeliveredAt, supervisorId: task.supervisorId, audit: task.audit })), null, 2));
+    failed.close();
+  } catch {}
+  child.kill('SIGTERM'); process.exitCode = 1;
+});
 child.on('exit', () => { try { fs.rmSync(fixture, { recursive: true, force: true }); } catch {} });

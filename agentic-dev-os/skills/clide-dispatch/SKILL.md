@@ -31,14 +31,14 @@ Do not include secrets, hidden transcripts, or unsupported assumptions.
 ## Validate before dispatch
 
 1. Read existing Clide tasks.
-2. Reject duplicate active ticket or branch ownership.
-3. Flag path-claim overlap.
-4. Keep unfinished dependencies attached to the task.
-5. Use a stable dispatch key so retries return the existing task.
+2. Read the repository brief and rely on Clide to snapshot it into the worker prompt.
+3. Reject duplicate active ticket or branch ownership.
+4. Use repository-relative glob claims and flag high/medium overlap.
+5. Keep unfinished dependencies attached to the task; reject missing references and cycles.
+6. Use a stable dispatch key so retries recover the existing lifecycle instead of creating another worker.
 
 Call `clide_dispatch_task` only after the specification is complete. Do not create Git worktrees or start provider CLIs manually.
 
 ## Report
 
-Return the task, provider, branch, worktree, port, dependencies, and whether it launched or remained blocked. If creation partially succeeds, preserve the recoverable task and report the exact failed stage.
-
+Return the task, provider, branch, worktree, port, dependencies, dispatch stage, and whether it launched or remained queued. If creation partially succeeds, preserve the recoverable task and report the exact failed stage.

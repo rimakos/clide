@@ -30,7 +30,9 @@ be Claude or Codex and receives workspace-scoped Clide MCP tools. Ask it to disp
 a ticket and it will define the branch, provider, prompt, commands, dependencies,
 and path claims; Clide then creates and launches the isolated worker automatically.
 The orchestrator coordinates the primary checkout but does not implement worker
-tickets there. See [CLIDE_ORCHESTRATOR_PLAN.md](CLIDE_ORCHESTRATOR_PLAN.md).
+tickets there. Dispatch is durable across reloads, provider startup and prompt
+delivery are acknowledged separately, and uncertain delivery requires an explicit
+operator decision. See [CLIDE_DURABLE_ORCHESTRATION_PLAN.md](CLIDE_DURABLE_ORCHESTRATION_PLAN.md).
 
 ## Flight-deck features
 
@@ -40,6 +42,12 @@ tickets there. See [CLIDE_ORCHESTRATOR_PLAN.md](CLIDE_ORCHESTRATOR_PLAN.md).
 - Four-pane agent grid, focus mode, attention states, task rail, and collapsible
   inspector.
 - Per-task dev ports and optional automatic dev-server terminals.
+- A durable dispatch state machine with revision-checked transitions, renderer
+  leases, bounded retries, exactly-once launch guards, and reload recovery.
+- Dependency scheduling with cycle detection and a configurable per-repository worker
+  limit, plus glob-aware path-claim risk before launch.
+- An Inbox for lifecycle recovery, approvals, audit history, dev health, and a durable
+  repository brief whose bounded snapshot is delivered to each worker.
 - Transactional local tasks, findings, messages, checks, layout, metrics, and recovery
   state in `~/.clide/state.db`, including automatic migration from the old JSON store.
 - A local Clide MCP server, automatically scoped into isolated Claude and Codex
@@ -102,6 +110,10 @@ installed globally unless you choose that action.
 Repository orchestrators use the bundled `clide-orchestrate`, `clide-dispatch`,
 `clide-supervise`, and `clide-integrate` skills. Install only those four without
 touching other bundled skills using `npm run setup-os -- --orchestrator`.
+
+Claude orchestrators start in plan mode and Codex orchestrators start in a read-only
+sandbox. Both coordinate through repository-scoped Clide tools and request approval
+for consequential operations.
 
 ## Safety model
 

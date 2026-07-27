@@ -11,10 +11,11 @@ Inspect the repository task set through Clide MCP and prioritize attention over 
 
 1. Approval requests.
 2. Blocked workers and failed setup/checks.
-3. Waiting workers that need a decision.
-4. Dependency and path-claim conflicts.
-5. Completed workers whose checks or review are stale.
-6. Healthy running workers.
+3. Failed or stalled dispatch stages and crashed dev processes.
+4. Waiting workers that need a decision or launch capacity.
+5. Dependency and path-claim conflicts.
+6. Completed workers whose checks or review are stale.
+7. Healthy running workers.
 
 Compare recorded check SHA with each task's current HEAD. Treat checks from another SHA as stale.
 
@@ -26,6 +27,8 @@ Compare recorded check SHA with each task's current HEAD. Treat checks from anot
 - Do not interrupt healthy work merely to request status.
 - Do not reassign a claimed path without surfacing the collision.
 - Keep provider-specific child agents under their owning Clide task; do not turn them into extra top-level worktrees.
+- Use the durable retry control for failed launches; do not create a replacement worktree for an idempotent dispatch.
+- Use `clide_request_approval` for actions requiring human authority.
 
 ## Detect stalls
 
@@ -33,5 +36,4 @@ Call work stalled only when lifecycle events, elapsed time, and lack of state ch
 
 ## Output
 
-Return a compact table or list containing task, provider, state, blocker/decision, changed paths, check freshness, and next action. Omit routine token-by-token activity.
-
+Return a compact table or list containing task, provider, dispatch stage, dev health, blocker/decision, changed paths, check freshness, and next action. Omit routine token-by-token activity.

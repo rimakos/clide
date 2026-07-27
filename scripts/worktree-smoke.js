@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+const { execFileSync } = require('child_process');
+
 const port = Number(process.argv[2] || 9333);
 
 async function connect() {
@@ -18,7 +20,9 @@ async function connect() {
     const requestId = ++id; pending.set(requestId, {
       reject,
       resolve(result) {
-        if (result.exceptionDetails) reject(new Error(result.exceptionDetails.text));
+        if (result.exceptionDetails) {
+          reject(new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text));
+        }
         else resolve(result.result.value);
       }
     });
@@ -45,16 +49,21 @@ async function main() {
     document.getElementById('workspace-new-task').click();
     const set = (id, value) => { const el = document.getElementById(id); el.value = value; el.dispatchEvent(new Event('input', { bubbles: true })); };
     set('task-ticket', 'E2E-1'); set('task-title', ${JSON.stringify(title)});
-    set('task-branch', ${JSON.stringify(branch)}); set('task-base', 'HEAD'); set('task-setup', 'npm test');
-    document.getElementById('task-dialog').requestSubmit();
+    set('task-prompt', 'Implement the isolated worktree smoke-test fixture and report completion.');
+    set('task-branch', ${JSON.stringify(branch)}); set('task-base', 'HEAD'); set('task-setup', 'git rev-parse --show-toplevel');
+    const form = document.getElementById('task-dialog');
+    const invalid = [...form.elements].filter(control => control.willValidate && !control.checkValidity()).map(control => control.id);
+    if (invalid.length) throw new Error('Invalid required task fields: ' + invalid.join(', '));
+    form.requestSubmit();
   })()`);
   await waitFor(() => evaluate(`getComputedStyle(document.getElementById('task-overlay')).display === 'none'`), 60000);
   const task = await waitFor(async () => {
     const value = await evaluate(`window.clide.ipc.invoke('state-snapshot').then(s => Object.values(s.tasks).find(t => t.title === ${JSON.stringify(title)}) || null)`);
-    return value;
-  });
+    return value && value.checks.some(check => check.type === 'setup') ? value : null;
+  }, 60000);
   if (!task.worktree || task.branch !== branch) throw new Error('Task/worktree metadata is incomplete.');
-  if (!task.checks.some(check => check.type === 'setup' && check.ok)) throw new Error('Setup profile did not pass.');
+  const setup = task.checks.find(check => check.type === 'setup');
+  if (!setup.ok) throw new Error(`Setup profile did not pass: ${(setup.output || '').slice(-500)}`);
   const before = await evaluate(`document.querySelectorAll('.tile-terminal-tabs .ttab').length`);
   await evaluate(`document.querySelector('.agent-tile.active .tile-shell').click()`);
   await waitFor(async () => (await evaluate(`document.querySelectorAll('.tile-terminal-tabs .ttab').length`)) > before);
@@ -62,7 +71,8 @@ async function main() {
   const cleanup = await evaluate(`window.clide.ipc.invoke('git-worktree-remove', { taskId: ${JSON.stringify(task.id)} })`);
   if (!cleanup.ok) throw new Error(cleanup.err || 'Worktree cleanup failed.');
   await evaluate(`window.clide.ipc.invoke('task-remove', { id: ${JSON.stringify(task.id)} })`);
-  console.log(JSON.stringify({ ok: true, title, branch, worktree: task.worktree, setup: 'passed', auxiliaryShell: 'passed', cleanup: 'passed' }, null, 2));
+  execFileSync('git', ['branch', '-D', branch], { cwd: task.repoRoot, stdio: 'pipe' });
+  console.log(JSON.stringify({ ok: true, title, branch, worktree: task.worktree, setup: setup.command, auxiliaryShell: 'passed', cleanup: 'passed' }, null, 2));
   socket.close(); setTimeout(() => process.exit(0), 25);
 }
 

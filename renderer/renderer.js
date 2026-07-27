@@ -2,6 +2,8 @@ const { ipc: ipcRenderer, webUtils } = window.clide;
 const { Terminal } = window;
 const { FitAddon } = window.FitAddon;
 const MarkdownIt = window.markdownit;
+const rendererInstance = `renderer:${crypto.randomUUID()}`;
+const dispatchesInFlight = new Set();
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: false });
 
@@ -41,11 +43,16 @@ const ICON = {
 
 /* ===================== sessions ===================== */
 const sessions = new Map(); // key -> session
+const sessionStarts = new Map(); // stable task/session identity -> in-flight start
 const terminalOwners = new Map(); // terminal key -> { session, terminal }
 const order = [];
 let activeKey = null;
 let providerAvailability = { claude: true, codex: true };
 let layoutMode = localStorage.getItem('clide-layout') || 'grid';
+let workbenchMode = localStorage.getItem('clide-workbench') || 'terminal';
+let explorerVisible = localStorage.getItem('clide-explorer-visible') !== 'false';
+let inspectorVisible = localStorage.getItem('clide-inspector-visible') === 'true';
+let environmentVisible = localStorage.getItem('clide-environment-visible') === 'true';
 let inspectorMode = 'files';
 let taskSnapshot = { tasks: {}, overlaps: [] };
 
@@ -153,14 +160,14 @@ function selectTerminal(s, key) {
   }
 }
 
-async function startAuxTerminal(s = cur(), title, persistentId) {
+async function startAuxTerminal(s = cur(), title, persistentId, kind = 'shell') {
   if (!s) return null;
-  const res = await ipcRenderer.invoke('terminal-start', { cwd: s.cwd, parentKey: s.key, persistentId });
+  const res = await ipcRenderer.invoke('terminal-start', { cwd: s.cwd, parentKey: s.key, persistentId, kind });
   if (!res || res.error) { toast((res && res.error) || 'Could not start shell', true); return null; }
   const shellNumber = s.terminals.filter(t => t.kind === 'shell').length + 1;
   const t = attachTerminal(s, {
     key: res.key,
-    kind: 'shell',
+    kind: res.kind || kind,
     title: title || `${res.shell || 'Shell'} ${shellNumber}`
   });
   t.persistentId = res.persistentId;
@@ -223,14 +230,35 @@ function renderTerminalTabs(s = cur()) {
   }
 }
 
-async function startSession({ cwd, resumeId, title, provider, taskId, persistentId, role, initialPrompt, restoreTabs, restoreActive, restoreShells, restoreTerminal }) {
-  const res = await ipcRenderer.invoke('session-start', { cwd, resumeId, provider: provider || 'claude', taskId, persistentId, role });
+async function startSession(options) {
+  const orchestratorRoot = options.role === 'orchestrator' ? (options.workspaceRoot || options.cwd) : null;
+  const identity = options.taskId ? `task:${options.taskId}` : (orchestratorRoot ? `orchestrator:${orchestratorRoot}` : (options.persistentId ? `session:${options.persistentId}` : null));
+  if (identity) {
+    const existing = [...sessions.values()].find(session => options.taskId ? session.taskId === options.taskId : (orchestratorRoot ? session.role === 'orchestrator' && (session.workspaceRoot === orchestratorRoot || session.cwd === orchestratorRoot) : session.persistentId === options.persistentId));
+    if (existing) return existing;
+    if (sessionStarts.has(identity)) return sessionStarts.get(identity);
+  }
+  const pending = startSessionInternal(options);
+  if (identity) sessionStarts.set(identity, pending);
+  try { return await pending; }
+  finally { if (identity && sessionStarts.get(identity) === pending) sessionStarts.delete(identity); }
+}
+
+async function startSessionInternal({ cwd, resumeId, title, provider, taskId, persistentId, role, recoverOnly, initialPrompt, dispatchLeaseId, restoreTabs, restoreActive, restoreShells, restoreTerminal }) {
+  let res = await ipcRenderer.invoke('session-start', { cwd, resumeId, provider: provider || 'claude', taskId, persistentId, role, recoverOnly });
+  if (res && !res.error && !res.key) {
+    const live = await ipcRenderer.invoke('sessions-list');
+    const match = (live || []).find(item => taskId ? item.taskId === taskId : (persistentId ? item.persistentId === persistentId : (role === 'orchestrator' && item.role === 'orchestrator' && (item.workspaceRoot === cwd || item.cwd === cwd))));
+    if (match) res = { ...res, ...match, recovered: true, reused: true };
+  }
   if (!res || res.error) {
     const message = (res && res.error) || 'Could not start agent session';
     console.error('session-start failed', message);
     toast(message, true);
     return null;
   }
+  const attached = sessions.get(res.key) || [...sessions.values()].find(session => res.taskId ? session.taskId === res.taskId : (res.role === 'orchestrator' && session.role === 'orchestrator' && session.workspaceRoot === res.workspaceRoot));
+  if (attached) return attached;
   const s = {
     key: res.key, cwd: res.cwd, repo: res.repo,
     provider: res.provider || provider || 'claude', taskId: res.taskId || taskId || null,
@@ -261,21 +289,33 @@ async function startSession({ cwd, resumeId, title, provider, taskId, persistent
     }
   }
   if (restoreShells && restoreShells.length) {
-    for (const shell of restoreShells) await startAuxTerminal(s, shell.title, shell.persistentId);
+    for (const shell of restoreShells) await startAuxTerminal(s, shell.title, shell.persistentId, shell.kind);
   }
   if (restoreTerminal != null && s.terminals[restoreTerminal]) {
     selectTerminal(s, s.terminals[restoreTerminal].key);
   }
-  if (initialPrompt && !res.recovered) deliverInitialPrompt(s, initialPrompt, taskId);
+  if (initialPrompt && (!res.recovered || dispatchLeaseId)) {
+    if (dispatchLeaseId) {
+      const ready = await ipcRenderer.invoke('dispatch-wait-ready', { taskId, timeout: 45000 });
+      if (!ready.ok) throw new Error(ready.error || 'Provider did not become ready.');
+    }
+    await deliverInitialPrompt(s, initialPrompt, taskId, dispatchLeaseId);
+  }
   return s;
 }
 
-function deliverInitialPrompt(session, prompt, taskId) {
+async function deliverInitialPrompt(session, prompt, taskId, dispatchLeaseId) {
   const body = String(prompt || '').trim(); if (!session || !body) return;
-  setTimeout(() => {
+  if (taskId && dispatchLeaseId) {
+    const sent = await ipcRenderer.invoke('dispatch-prompt-send', { taskId, sessionKey: session.key, leaseId: dispatchLeaseId, actor: rendererInstance, prompt: body });
+    if (!sent.ok) throw new Error(sent.error || 'Prompt write was rejected.');
+    const acknowledged = await ipcRenderer.invoke('dispatch-wait-prompt', { taskId, writeId: sent.writeId, timeout: 10000 });
+    if (!acknowledged.ok) throw new Error(acknowledged.error || 'Prompt delivery could not be confirmed.');
+  } else {
+    await new Promise(resolve => setTimeout(resolve, 1000));
     ipcRenderer.send('session-input', { key: session.key, data: body + '\r' });
-    if (taskId) ipcRenderer.invoke('task-patch', { id: taskId, patch: { promptDeliveredAt: new Date().toISOString() } }).catch(() => {});
-  }, 1000);
+    if (taskId) await ipcRenderer.invoke('task-patch', { id: taskId, patch: { promptDeliveredAt: new Date().toISOString() } });
+  }
 }
 
 function switchSession(key) {
@@ -297,6 +337,7 @@ function switchSession(key) {
   setTimeout(() => { fitAll(); const t = activeTerminal(s); if (t) t.term.focus(); }, 0);
   pollStatus();
   renderTaskRail();
+  refreshEnvironment();
 }
 
 function closeSession(key) {
@@ -377,6 +418,7 @@ async function openInSession(key, p) {
 /* ===================== terminal sizing / split ===================== */
 function fitActive() {
   const t = activeTerminal(); if (!t) return;
+  if (t.exited) return;
   try { t.fit.fit(); } catch {}
   ipcRenderer.send('session-resize', { key: t.key, cols: t.term.cols, rows: t.term.rows });
 }
@@ -384,6 +426,7 @@ function fitAll() {
   for (const s of sessions.values()) {
     if (!s.tileEl || s.tileEl.style.display === 'none') continue;
     const t = activeTerminal(s); if (!t) continue;
+    if (t.exited) continue;
     try { t.fit.fit(); } catch {}
     ipcRenderer.send('session-resize', { key: t.key, cols: t.term.cols, rows: t.term.rows });
   }
@@ -402,8 +445,8 @@ window.addEventListener('mousemove', e => {
     const right = rect.right - e.clientX;
     if (right > 260 && right < rect.width - 360) { $('right').style.flex = `0 0 ${right}px`; fitAll(); }
   } else {
-    const left = e.clientX - rect.left;
-    if (left > 160 && left < rect.width - 400) { explorer.style.flex = `0 0 ${left}px`; fitAll(); }
+    const width = rect.right - e.clientX;
+    if (width > 200 && width < rect.width - 400) { explorer.style.flex = `0 0 ${width}px`; fitAll(); }
   }
 });
 
@@ -417,12 +460,28 @@ let treeBuildVersion = 0;
 
 $('explorer-toggle').onclick = () => setExplorer(false);
 explorerShow.onclick = () => setExplorer(true);
-function setExplorer(show) {
-  explorer.style.display = show ? 'flex' : 'none';
-  $('divider-left').style.display = show ? 'block' : 'none';
-  explorerShow.style.display = show ? 'none' : 'flex';
+function setExplorer(show, { persist = true } = {}) {
+  const visible = Boolean(show);
+  if (persist) {
+    explorerVisible = visible;
+    localStorage.setItem('clide-explorer-visible', String(explorerVisible));
+  }
+  explorer.style.display = visible ? 'flex' : 'none';
+  $('divider-left').style.display = visible ? 'block' : 'none';
+  explorerShow.style.display = visible ? 'none' : 'flex';
+  if (workbenchMode !== 'terminal') $('inspector-toggle').classList.toggle('on', visible);
   fitActive();
 }
+
+function setEnvironmentVisible(show, { persist = true } = {}) {
+  environmentVisible = Boolean(show);
+  if (persist) localStorage.setItem('clide-environment-visible', String(environmentVisible));
+  $('environment-sidebar').style.display = environmentVisible ? 'flex' : 'none';
+  $('sidebar-toggle-top').classList.toggle('on', environmentVisible);
+  $('sidebar-toggle-top').setAttribute('aria-pressed', String(environmentVisible));
+  setTimeout(fitAll, 0);
+}
+$('sidebar-toggle-top').onclick = () => setEnvironmentVisible(!environmentVisible);
 
 async function buildTree(s) {
   const version = ++treeBuildVersion;
@@ -921,8 +980,8 @@ function showMenu(anchor, items, dir) {
   else m.style.top = (r.bottom + 6) + 'px';
   setTimeout(() => window.addEventListener('mousedown', closeMenuOnce, true), 0);
 }
-function refreshGitAll() { if (panelMode === 'git') loadGit(); pollStatus(); }
-async function openBranchMenu() {
+function refreshGitAll() { if (panelMode === 'git') loadGit(); pollStatus(); refreshEnvironment(); }
+async function openBranchMenu(anchor = $('st-branch'), direction = 'up') {
   const s = cur(); if (!s) return;
   const data = await ipcRenderer.invoke('git-branches', { cwd: s.cwd });
   if (!data || !data.branches.length) { toast('Not a git repo', true); return; }
@@ -947,11 +1006,11 @@ async function openBranchMenu() {
       }
     });
   }
-  showMenu($('st-branch'), items, 'up');
+  showMenu(anchor, items, direction);
 }
 $('st-branch').style.cursor = 'pointer';
 $('st-branch').title = 'Switch / create branch';
-$('st-branch').onclick = openBranchMenu;
+$('st-branch').onclick = () => openBranchMenu();
 
 /* ===================== drag & drop file paths into terminal ===================== */
 function quotePath(p) { return /[^\w@%+=:,./-]/.test(p) ? "'" + p.replace(/'/g, `'\\''`) + "'" : p; }
@@ -1109,7 +1168,9 @@ async function refreshTaskSnapshot() {
   renderTaskRail();
   for (const s of sessions.values()) renderTileRibbon(s);
   if (inspectorMode !== 'files') renderInspector();
-  const attention = Object.values(taskSnapshot.tasks || {}).filter(t => ['waiting', 'approval', 'blocked', 'done'].includes(t.state));
+  const attention = Object.values(taskSnapshot.tasks || {}).filter(t => ['waiting', 'approval', 'blocked', 'done'].includes(t.state) ||
+    (t.dispatch && ['failed', 'blocked', 'waiting-dependencies', 'waiting-capacity'].includes(t.dispatch.stage)) ||
+    (t.approvals || []).some(item => item.status === 'pending'));
   $('attention-count').textContent = String(attention.length);
   $('attention-toggle').classList.toggle('has-attention', attention.length > 0);
 }
@@ -1128,6 +1189,7 @@ function renderTaskRail() {
   for (const task of items) {
     const session = task.sessionKey ? sessions.get(task.sessionKey) : [...sessions.values()].find(s => s.taskId === task.id);
     const state = task.blockedBy && task.blockedBy.length ? 'blocked' : (session && session.status ? session.status.state : task.state);
+    const dispatchStage = task.dispatch && task.dispatch.stage;
     const overlaps = (taskSnapshot.overlaps || []).filter(item => item.taskIds.includes(task.id));
     const card = document.createElement('div');
     card.className = `task-card ${task.provider} ${task.role === 'orchestrator' ? 'orchestrator' : ''}` + (session && session.key === activeKey ? ' active' : '') +
@@ -1136,10 +1198,12 @@ function renderTaskRail() {
     card.innerHTML = `<div class="task-card-top"><span class="task-ticket">${escapeHtml(task.ticket || 'TASK')}</span>` +
       `<span class="task-state ${escapeHtml(state || 'draft')}">${escapeHtml(state || 'draft')}</span></div>` +
       `<div class="task-title">${escapeHtml(task.title)}</div>` +
-      `<div class="task-branch">${escapeHtml(task.branch || 'shared checkout')} · ${changed || 0} changed${overlaps.length ? ' · ⚠ overlap' : ''}${task.blockedBy && task.blockedBy.length ? ` · waits for ${task.blockedBy.length}` : ''}</div>`;
+      `<div class="task-branch">${escapeHtml(task.branch || 'shared checkout')} · ${changed || 0} changed${overlaps.length ? ` · ⚠ ${overlaps.some(item => item.severity === 'high') ? 'high ' : ''}overlap` : ''}${task.blockedBy && task.blockedBy.length ? ` · waits for ${task.blockedBy.length}` : ''}</div>` +
+      (dispatchStage ? `<div class="task-runtime"><span class="dispatch-chip ${escapeHtml(dispatchStage)}">${escapeHtml(dispatchStage)}</span>${task.dev ? `<span class="dev-chip ${escapeHtml(task.dev.status)}">:${task.port} ${escapeHtml(task.dev.status)}</span>` : ''}</div>` : '');
     card.onclick = async () => {
       if (session) switchSession(session.key);
-      else if (task.worktree) await startSession({ cwd: task.worktree, provider: task.provider, title: task.title, taskId: task.id });
+      else if (task.dispatch && task.dispatch.stage !== 'running') await processDurableDispatch(task.id);
+      else if (task.worktree) await startSession({ cwd: task.worktree, provider: task.provider, title: task.title, taskId: task.id, persistentId: task.supervisorId || `worker-${task.id}`, initialPrompt: task.promptDeliveredAt ? '' : task.launchPrompt });
       else {
         showTaskDialog(cur(), task);
       }
@@ -1268,46 +1332,89 @@ $('task-dialog').onsubmit = async event => {
     provider: $('task-provider').value, branch: $('task-branch').value.trim(), baseRef: $('task-base').value.trim() || 'HEAD',
     setupCommand: $('task-setup').value.trim(), devCommand: $('task-dev').value.trim(),
     dependencies: $('task-dependencies').value.split(',').map(value => value.trim()).filter(Boolean),
-    launchPrompt: $('task-prompt').value.trim(), createdBy: source.role === 'orchestrator' ? `orchestrator:${source.persistentId}` : 'user'
+    launchPrompt: $('task-prompt').value.trim(), createdBy: source.role === 'orchestrator' ? `orchestrator:${source.persistentId}` : 'user',
+    dispatch: { stage: 'worktree-created', requestedAt: new Date().toISOString(), lastActor: 'user' }
   };
   try {
     const result = await ipcRenderer.invoke('git-worktree-create', payload);
     if (!result || !result.ok) throw new Error(result && (result.err || result.error) || 'Could not create worktree.');
-    if (payload.setupCommand) {
-      submit.textContent = 'Running setup…';
-      const setup = await ipcRenderer.invoke('setup-run', { taskId: result.task.id, command: payload.setupCommand });
-      if (!setup.ok) throw new Error(`Worktree created, but setup failed:\n${(setup.err || setup.out || '').slice(-600)}`);
-    }
     closeTaskDialog();
-    const started = await startSession({ cwd: result.cwd, provider: payload.provider, title: payload.taskName, taskId: result.task.id, role: 'worker', initialPrompt: payload.launchPrompt });
-    if (started && payload.devCommand) {
-      const terminal = await startAuxTerminal(started, 'Dev server');
-      if (terminal) ipcRenderer.send('session-input', { key: terminal.key, data: `PORT=${result.port} ${payload.devCommand}\r` });
-    }
+    await processDurableDispatch(result.task.id);
     await refreshTaskSnapshot();
     toast(`${result.branch} · port ${result.port}`);
   } catch (error) { $('task-dialog-error').textContent = error.message; }
   submit.disabled = false; submit.textContent = 'Create and launch';
 };
 
-ipcRenderer.on('orchestrator-dispatch', async (_event, result) => {
-  if (!result || !result.task || [...sessions.values()].some(session => session.taskId === result.task.id)) return;
+async function processDurableDispatch(taskId) {
+  if (!taskId || dispatchesInFlight.has(taskId)) return;
+  dispatchesInFlight.add(taskId);
+  let claim;
   try {
-    if (result.task.setupCommand) {
-      const setup = await ipcRenderer.invoke('setup-run', { taskId: result.task.id, command: result.task.setupCommand });
+    claim = await ipcRenderer.invoke('dispatch-claim', { taskId, owner: rendererInstance });
+    if (!claim || !claim.ok) return;
+    if (claim.action === 'wait') { await refreshTaskSnapshot(); return; }
+    if (claim.action === 'prompt-uncertain') throw new Error('A previous prompt write may have reached the provider but was not acknowledged. Review the terminal, then use Retry launch only if the prompt is absent.');
+    let task = claim.task;
+    if (claim.action === 'setup') {
+      const setup = await ipcRenderer.invoke('setup-run', { taskId: task.id, command: task.setupCommand });
       if (!setup.ok) throw new Error(`Setup failed: ${(setup.err || setup.out || '').slice(-500)}`);
+      const advanced = await ipcRenderer.invoke('dispatch-transition', {
+        taskId: task.id, leaseId: claim.leaseId, expected: 'setup-running', to: 'launching',
+        actor: rendererInstance, reason: 'Worktree setup completed', patch: { setupCompletedAt: new Date().toISOString() }
+      });
+      if (!advanced.ok) throw new Error(advanced.error || `Setup acknowledgement conflicted at ${advanced.stage || 'unknown stage'}.`);
+      task = advanced.task;
     }
-    const started = await startSession({ cwd: result.cwd, provider: result.provider, title: result.task.title, taskId: result.task.id, role: 'worker', initialPrompt: result.prompt });
-    if (started && result.task.devCommand) {
-      const terminal = await startAuxTerminal(started, 'Dev server');
-      if (terminal) ipcRenderer.send('session-input', { key: terminal.key, data: `PORT=${result.port} ${result.task.devCommand}\r` });
+
+    let started = [...sessions.values()].find(session => session.taskId === task.id);
+    if (started && task.dispatch.stage === 'launching') {
+      const ready = await ipcRenderer.invoke('dispatch-session-ready', { taskId: task.id, sessionKey: started.key });
+      if (!ready.ok) throw new Error(ready.error || 'Existing provider session could not confirm readiness.');
+      task = ready.task;
     }
-    await refreshTaskSnapshot(); toast(`Orchestrator launched ${result.task.ticket || result.task.title}`);
+    if (!started) started = await startSession({
+      cwd: task.worktree, provider: task.provider, title: task.title, taskId: task.id,
+      persistentId: task.supervisorId || `worker-${task.id}`, role: 'worker',
+      initialPrompt: task.launchPrompt, dispatchLeaseId: claim.leaseId
+    });
+    else if (task.dispatch.stage === 'provider-ready' && !task.dispatch.promptAcknowledgedAt) {
+      await deliverInitialPrompt(started, task.launchPrompt, task.id, claim.leaseId);
+    }
+    if (!started) throw new Error('Provider worker did not attach.');
+
+    const latest = await ipcRenderer.invoke('state-snapshot');
+    const liveTask = latest.tasks[task.id];
+    if (liveTask && liveTask.dispatch && liveTask.dispatch.stage === 'prompt-delivered') {
+      const running = await ipcRenderer.invoke('dispatch-transition', {
+        taskId: task.id, leaseId: claim.leaseId, expected: 'prompt-delivered', to: 'running',
+        actor: rendererInstance, reason: 'Worker launch pipeline completed',
+        patch: { runningAt: new Date().toISOString(), leaseId: '', leaseOwner: '', leaseExpiresAt: '' },
+        taskPatch: { state: 'running' }
+      });
+      if (!running.ok) throw new Error(running.error || `Running acknowledgement conflicted at ${running.stage || 'unknown stage'}.`);
+    }
+
+    if (task.devCommand && !started.terminals.some(terminal => terminal.title === 'Dev server')) {
+      const terminal = await startAuxTerminal(started, 'Dev server', undefined, 'dev');
+      if (terminal) ipcRenderer.send('session-input', { key: terminal.key, data: `PORT=${task.port} ${task.devCommand}\r` });
+    }
+    await refreshTaskSnapshot(); toast(`Orchestrator launched ${task.ticket || task.title}`);
   } catch (error) {
-    const finding = { id: `launch-${Date.now()}`, body: error.message, level: 'blocking', from: 'clide', at: new Date().toISOString() };
-    await ipcRenderer.invoke('task-patch', { id: result.task.id, patch: { state: 'blocked', findings: [...(result.task.findings || []), finding] } });
+    await ipcRenderer.invoke('dispatch-fail', { taskId, leaseId: claim && claim.leaseId, actor: rendererInstance, error: error.message, retry: !(claim && claim.action === 'prompt-uncertain') });
     await refreshTaskSnapshot(); toast(error.message, true);
+  } finally {
+    dispatchesInFlight.delete(taskId);
   }
+}
+
+async function recoverDurableDispatches() {
+  const pending = await ipcRenderer.invoke('dispatch-pending', {});
+  for (const item of pending || []) await processDurableDispatch(item.task.id);
+}
+
+ipcRenderer.on('orchestrator-dispatch', async (_event, result) => {
+  await processDurableDispatch(result && (result.taskId || (result.task && result.task.id)));
 });
 
 async function promptTaskMessage(s) {
@@ -1339,11 +1446,51 @@ function setInspector(mode) {
 document.querySelectorAll('#inspector-tabs button').forEach(button => button.onclick = () => setInspector(button.dataset.inspector));
 
 function section(title, body) { return `<section class="inspector-section"><h3>${escapeHtml(title)}</h3>${body}</section>`; }
+const DISPATCH_RUNWAY = ['worktree-created', 'setup-running', 'launching', 'provider-ready', 'prompt-delivered', 'running'];
+function dispatchRunway(task) {
+  if (!task.dispatch) return '<div class="inspector-item">This task uses the legacy manual launch path.</div>';
+  const stage = task.dispatch.stage; const index = DISPATCH_RUNWAY.indexOf(stage);
+  return `<div class="dispatch-runway">${DISPATCH_RUNWAY.map((name, step) => `<span class="${step < index ? 'passed' : step === index ? 'current' : ''}" title="${escapeHtml(name)}">${step + 1}<small>${escapeHtml(name.replaceAll('-', ' '))}</small></span>`).join('')}</div>` +
+    (task.dispatch.lastError ? `<div class="inspector-item check-fail">${escapeHtml(task.dispatch.lastError)}<small>attempt ${task.dispatch.attempt} · retry ${escapeHtml(task.dispatch.nextRetryAt || 'manual')}</small></div>` : '');
+}
+
+function renderOrchestratorInbox(session) {
+  const panel = $('inspector-panel'); const root = session.workspaceRoot || session.cwd;
+  const workspace = taskSnapshot.workspaces && taskSnapshot.workspaces[root] || {}; const context = workspace.context || {};
+  const tasks = Object.values(taskSnapshot.tasks || {}).filter(task => task.repoRoot === root && task.state !== 'archived');
+  const inbox = tasks.filter(task => ['waiting', 'approval', 'blocked', 'done'].includes(task.state) || (task.dispatch && ['failed', 'waiting-dependencies', 'waiting-capacity'].includes(task.dispatch.stage)) || (task.approvals || []).some(item => item.status === 'pending'));
+  const inboxBody = inbox.map(task => {
+    const pending = (task.approvals || []).filter(item => item.status === 'pending').length;
+    return `<div class="inbox-card"><b>${escapeHtml(task.ticket || task.title)}</b><span>${escapeHtml(task.dispatch && task.dispatch.stage || task.state)}</span><p>${escapeHtml(task.title)}</p><small>${pending ? `${pending} approval request${pending === 1 ? '' : 's'} · ` : ''}${escapeHtml(task.dev && task.dev.status || '')}</small><button data-focus-task="${escapeHtml(task.id)}">Open</button></div>`;
+  }).join('') || '<div class="inspector-item check-pass">The fleet has no blockers or decisions waiting.</div>';
+  const decisions = (context.decisions || []).slice(-8).reverse().map(item => `<div class="inspector-item">${escapeHtml(item.title)}<small>${escapeHtml(item.body)} · ${escapeHtml(item.at || '')}</small></div>`).join('') || '<div class="inspector-item">No repository decisions recorded.</div>';
+  panel.innerHTML = section(`Orchestrator inbox · ${inbox.length}`, inboxBody) +
+    section('Repository brief', `<form id="workspace-context-form" class="context-form"><label>Brief<textarea name="summary" rows="4" placeholder="What every worker needs to understand">${escapeHtml(context.summary || '')}</textarea></label><label>Constraints<textarea name="constraints" rows="3" placeholder="One constraint per line">${escapeHtml((context.constraints || []).join('\n'))}</textarea></label><label>Useful commands<textarea name="commands" rows="3" placeholder="One command per line">${escapeHtml((context.commands || []).join('\n'))}</textarea></label><label>Conventions<textarea name="conventions" rows="3" placeholder="One convention per line">${escapeHtml((context.conventions || []).join('\n'))}</textarea></label><div><button type="submit">Save brief</button><button id="record-decision" type="button">Record decision</button></div></form>`) + section('Recent decisions', decisions);
+  panel.querySelectorAll('[data-focus-task]').forEach(button => button.onclick = () => {
+    const task = taskSnapshot.tasks[button.dataset.focusTask]; const worker = [...sessions.values()].find(item => item.taskId === task.id);
+    if (worker) switchSession(worker.key); else if (task.dispatch) processDurableDispatch(task.id); else setPanelMode('tasks');
+  });
+  $('workspace-context-form').onsubmit = async event => {
+    event.preventDefault(); const data = new FormData(event.currentTarget); const lines = name => String(data.get(name) || '').split('\n').map(value => value.trim()).filter(Boolean);
+    await ipcRenderer.invoke('workspace-context-set', { root, context: { summary: data.get('summary'), constraints: lines('constraints'), commands: lines('commands'), conventions: lines('conventions') } });
+    await refreshTaskSnapshot(); toast('Repository brief saved');
+  };
+  $('record-decision').onclick = async () => {
+    const title = prompt('Decision title:'); if (!title) return; const body = prompt('Decision and reason:'); if (!body) return;
+    const decisions = [...(context.decisions || []), { id: crypto.randomUUID(), title, body, at: new Date().toISOString(), by: 'user' }];
+    await ipcRenderer.invoke('workspace-context-set', { root, context: { decisions } }); await refreshTaskSnapshot(); toast('Decision recorded');
+  };
+}
+
 function renderInspector() {
   const panel = $('inspector-panel');
   const task = activeTask();
   panel.innerHTML = '';
-  if (!task) { panel.innerHTML = '<div class="inspector-empty">This session is not attached to an isolated task.<br>Create a task to use coordination, checks, and integration.</div>'; return; }
+  if (!task) {
+    const session = cur();
+    if (session && session.role === 'orchestrator' && inspectorMode === 'messages') { renderOrchestratorInbox(session); return; }
+    panel.innerHTML = '<div class="inspector-empty">This session is not attached to an isolated task.<br>Open Inbox on the orchestrator or create a task for worker details.</div>'; return;
+  }
   if (inspectorMode === 'messages') {
     const findings = (task.findings || []).map(item => `<div class="inspector-item">${escapeHtml(item.body)}<small>${escapeHtml(item.level || 'info')} · ${escapeHtml(item.from || 'agent')} · ${escapeHtml(item.at || '')}</small></div>`).join('') || '<div class="inspector-item">No published findings.</div>';
     const messages = (task.messages || []).map(item => `<div class="inspector-item">${escapeHtml(item.body)}<small>${escapeHtml(item.from || 'agent')} · ${escapeHtml(item.at || '')}</small></div>`).join('') || '<div class="inspector-item">No queued messages.</div>';
@@ -1352,7 +1499,14 @@ function renderInspector() {
     const claims = (task.pathClaims || []).map(item => `<div class="inspector-item">${escapeHtml(item.path)}<small>${escapeHtml(item.note || 'claimed path')} · ${escapeHtml(item.at || '')}</small></div>`).join('') || '<div class="inspector-item">No paths claimed yet.</div>';
     const artifacts = (task.artifacts || []).map(item => `<div class="inspector-item">${escapeHtml(item.label || item.path)}<small>${escapeHtml(item.kind || 'file')} · ${escapeHtml(item.path || '')}</small></div>`).join('') || '<div class="inspector-item">No artifacts published yet.</div>';
     const dependencyItems = (task.dependencies || []).map(id => { const dependency = taskSnapshot.tasks[id]; return `<div class="inspector-item ${dependency && ['done','archived'].includes(dependency.state) ? 'check-pass' : 'check-fail'}">${escapeHtml(dependency ? dependency.title : id)}<small>${escapeHtml(dependency ? dependency.state : 'missing')}</small></div>`; }).join('') || '<div class="inspector-item">No task dependencies.</div>';
-    panel.innerHTML = section('Dependencies', dependencyItems) + section('Child agents', agents) + section('Path ownership', claims) + section('Artifacts', artifacts) + section('Provider events', events) + section('Published findings', findings) + section('Messages', messages) + section('Send message', '<form id="message-form" class="inspector-form"><input placeholder="Durable context update" /><button>Send</button></form>');
+    const approvals = (task.approvals || []).slice().reverse().map(item => `<div class="inspector-item approval-item ${escapeHtml(item.status)}"><b>${escapeHtml(item.title)}</b><div>${escapeHtml(item.body)}</div>${item.command ? `<code>${escapeHtml(item.command)}</code>` : ''}<small>${escapeHtml(item.status)} · ${escapeHtml(item.requestedAt || '')}</small>${item.status === 'pending' ? `<div class="approval-actions"><button data-approval="${escapeHtml(item.id)}" data-approved="1">Approve</button><button data-approval="${escapeHtml(item.id)}" data-approved="0">Reject</button></div>` : ''}</div>`).join('') || '<div class="inspector-item">No approval requests.</div>';
+    const audit = (task.audit || []).slice(-30).reverse().map(item => `<div class="audit-row"><span>${escapeHtml(item.type)}</span><small>${escapeHtml(item.actor)} · ${escapeHtml(item.at)}</small><p>${escapeHtml(item.reason || '')}</p></div>`).join('') || '<div class="inspector-item">No audited actions yet.</div>';
+    const dev = task.dev ? `<div class="inspector-item dev-health ${escapeHtml(task.dev.status)}">${escapeHtml(task.dev.status)} · <a>${escapeHtml(task.dev.url || `http://127.0.0.1:${task.port}`)}</a><small>last checked ${escapeHtml(task.dev.lastCheckedAt || 'not yet')}</small></div>` : '<div class="inspector-item">No dev command configured.</div>';
+    const controls = task.dispatch && task.dispatch.stage !== 'running' && task.dispatch.stage !== 'cancelled' ? `<div class="integration-actions"><button id="retry-dispatch">Retry launch</button><button id="cancel-dispatch">Cancel launch</button></div>` : '';
+    panel.innerHTML = section('Dispatch runway', dispatchRunway(task) + controls) + section('Dev environment', dev) + section('Approvals', approvals) + section('Dependencies', dependencyItems) + section('Child agents', agents) + section('Path ownership', claims) + section('Artifacts', artifacts) + section('Provider events', events) + section('Published findings', findings) + section('Messages', messages) + section('Audit trail', audit) + section('Send message', '<form id="message-form" class="inspector-form"><input placeholder="Durable context update" /><button>Send</button></form>');
+    if ($('retry-dispatch')) $('retry-dispatch').onclick = async () => { const result = await ipcRenderer.invoke('dispatch-retry', { taskId: task.id }); toast(result.ok ? 'Launch queued again' : result.error, !result.ok); await refreshTaskSnapshot(); };
+    if ($('cancel-dispatch')) $('cancel-dispatch').onclick = async () => { if (!confirm('Cancel this worker launch? The branch and worktree are kept.')) return; await ipcRenderer.invoke('dispatch-cancel', { taskId: task.id }); await refreshTaskSnapshot(); };
+    panel.querySelectorAll('[data-approval]').forEach(button => button.onclick = async () => { await ipcRenderer.invoke('approval-resolve', { taskId: task.id, approvalId: button.dataset.approval, approved: button.dataset.approved === '1' }); await refreshTaskSnapshot(); });
     $('message-form').onsubmit = async event => { event.preventDefault(); const input = event.currentTarget.querySelector('input'); if (!input.value.trim()) return; await ipcRenderer.invoke('coord-publish', { taskId: task.id, kind: 'message', body: input.value.trim(), from: 'user' }); await refreshTaskSnapshot(); };
   } else if (inspectorMode === 'checks') {
     const checks = (task.checks || []).slice().reverse().map(item => `<div class="inspector-item ${item.ok ? 'check-pass' : 'check-fail'}">${item.ok ? '✓' : '×'} ${escapeHtml(item.command || item.type)}<small>${escapeHtml(item.sha || '')} ${escapeHtml(item.at || '')}</small></div>`).join('') || '<div class="inspector-item">No checks recorded.</div>';
@@ -1396,24 +1550,201 @@ function renderInspector() {
 }
 
 $('attention-toggle').onclick = () => { setPanelMode('tasks'); setExplorer(true); };
-$('inspector-toggle').onclick = () => { const right = $('right'); right.style.display = right.style.display === 'none' ? 'flex' : 'none'; setTimeout(fitAll, 0); };
+$('inspector-toggle').onclick = () => setInspectorVisible(workbenchMode === 'terminal' ? $('right').style.display === 'none' : explorer.style.display === 'none');
 $('task-doctor').onclick = async () => { const result = await ipcRenderer.invoke('doctor-run'); alert(`Clide doctor\n\nGit: ${result.git || 'missing'}\nClaude: ${result.providers.claude ? 'ready' : 'missing'}\nCodex: ${result.providers.codex ? 'ready' : 'missing'}\nnode-pty: ${result.nodePty ? 'ready' : 'missing'}\nDetached sessions: ${result.supervisor.screen ? 'ready' : 'missing'}\nClaude skills: ${result.skills.claude ? 'found' : 'not installed'}\nCodex skills: ${result.skills.codex ? 'found' : 'not installed'}\nShim: authenticated on ${result.shim.socket}`); };
 
-setInterval(refreshTaskSnapshot, 4000);
+setInterval(async () => { await refreshTaskSnapshot(); await recoverDurableDispatches(); }, 4000);
 
 /* ===================== panel mode (files / git) ===================== */
 let panelMode = 'tasks';
 document.querySelectorAll('.ptab').forEach(t => { t.onclick = () => setPanelMode(t.dataset.mode); });
-function setPanelMode(mode) {
+function setPanelMode(mode, { selectFirst = false } = {}) {
   panelMode = mode;
   document.querySelectorAll('.ptab').forEach(t => t.classList.toggle('active', t.dataset.mode === mode));
   $('files-pane').style.display = mode === 'files' ? 'flex' : 'none';
   $('tasks-pane').style.display = mode === 'tasks' ? 'flex' : 'none';
   $('git-pane').style.display = mode === 'git' ? 'flex' : 'none';
-  if (mode === 'git') loadGit();
+  if (mode === 'git') loadGit({ selectFirst });
   if (mode === 'tasks') renderTaskRail();
 }
 setPanelMode('tasks');
+
+/* ===================== workbench shell ===================== */
+const WORKBENCH_MODES = new Set(['review', 'terminal', 'files']);
+const toolOverlay = $('tool-overlay');
+let environmentRefresh = 0;
+
+function setInspectorVisible(show) {
+  if (workbenchMode === 'terminal') {
+    inspectorVisible = Boolean(show);
+    localStorage.setItem('clide-inspector-visible', String(inspectorVisible));
+    $('right').style.display = inspectorVisible ? 'flex' : 'none';
+    $('inspector-toggle').classList.toggle('on', inspectorVisible);
+  } else {
+    setExplorer(show);
+  }
+  setTimeout(fitAll, 0);
+}
+
+function setWorkbenchMode(mode, { persist = true } = {}) {
+  if (!WORKBENCH_MODES.has(mode)) return;
+  workbenchMode = mode;
+  document.body.dataset.workbench = mode;
+  if (persist) localStorage.setItem('clide-workbench', mode);
+  document.querySelectorAll('.workbench-tab').forEach(button => {
+    const active = button.dataset.workbench === mode;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
+  });
+  $('terminal-focus').classList.toggle('on', mode === 'terminal');
+  if (mode === 'review') {
+    setPanelMode('git', { selectFirst: true });
+    setInspector('files');
+    $('right').style.display = 'flex';
+    setExplorer(true, { persist: false });
+  } else if (mode === 'files') {
+    setPanelMode('files');
+    setInspector('files');
+    $('right').style.display = 'flex';
+    setExplorer(true, { persist: false });
+  } else {
+    setPanelMode('tasks');
+    $('right').style.display = inspectorVisible ? 'flex' : 'none';
+    setExplorer(false, { persist: false });
+  }
+  $('inspector-toggle').classList.toggle('on', mode === 'terminal' ? inspectorVisible : explorer.style.display !== 'none');
+  setEnvironmentVisible(environmentVisible, { persist: false });
+  refreshEnvironment();
+  if (persist) saveState();
+  setTimeout(fitAll, 0);
+}
+
+function openToolLauncher() {
+  toolOverlay.style.display = 'flex';
+  const first = toolOverlay.querySelector('[data-open-tool]');
+  if (first) setTimeout(() => first.focus(), 0);
+}
+function closeToolLauncher() { toolOverlay.style.display = 'none'; }
+
+function pullRequestTitle(branch, commits) {
+  if (commits && commits.length === 1) return commits[0];
+  const leaf = String(branch || '').split('/').pop() || 'Update';
+  return leaf.replace(/[-_]+/g, ' ').replace(/\b\w/g, character => character.toUpperCase());
+}
+
+async function openPullRequestDialog() {
+  const s = cur();
+  if (!s) return toast('Open a repository first', true);
+  const overlay = $('pr-overlay');
+  const error = $('pr-dialog-error');
+  error.className = '';
+  error.textContent = 'Loading branch details…';
+  $('pr-submit').disabled = true;
+  $('pr-submit').textContent = 'Create pull request';
+  overlay.dataset.sessionKey = s.key;
+  overlay.style.display = 'flex';
+  try {
+    const preview = await ipcRenderer.invoke('git-pr-preview', { cwd: s.cwd });
+    if (!preview.ok) throw new Error(preview.err || 'Pull request preview failed.');
+    $('pr-head').textContent = preview.branch;
+    $('pr-base').value = preview.base;
+    $('pr-title').value = pullRequestTitle(preview.branch, preview.commits);
+    $('pr-body').value = preview.commits.length
+      ? `## Summary\n\n${preview.commits.slice(0, 8).map(commit => `- ${commit}`).join('\n')}\n\n## Verification\n\n- [ ] Add verification notes`
+      : '';
+    $('pr-summary').textContent =
+      `${preview.commits.length} commit${preview.commits.length === 1 ? '' : 's'} · ${preview.files} changed file${preview.files === 1 ? '' : 's'} · +${preview.additions} −${preview.deletions}`;
+    $('pr-submit').disabled = !preview.available || !preview.upstream;
+    error.textContent = preview.available ? (preview.upstream ? `Published branch: ${preview.upstream}` : 'This branch has no upstream. Push it before creating the pull request.') : preview.ghError;
+    error.className = preview.available && preview.upstream ? 'success' : '';
+    setTimeout(() => $('pr-title').focus(), 0);
+  } catch (errorValue) {
+    error.textContent = errorValue.message;
+    $('pr-submit').disabled = true;
+  }
+}
+
+function closePullRequestDialog() {
+  $('pr-overlay').style.display = 'none';
+  $('pr-dialog-error').className = '';
+}
+
+async function refreshEnvironment() {
+  const version = ++environmentRefresh;
+  const s = cur();
+  const repo = s && (s.repo || (s.status && s.status.repo)) || '';
+  const branch = s && s.status && s.status.branch || '';
+  $('workbench-repo').textContent = repo || 'No workspace';
+  $('workbench-branch').textContent = branch ? `／ ${branch}` : '';
+  $('environment-branch').textContent = branch || 'No branch';
+  const task = activeTask();
+  $('environment-local').textContent = task && task.dev && task.dev.status ? task.dev.status : 'ready';
+  if (!s) {
+    $('environment-diffstat').innerHTML = '<b>0</b>';
+    return;
+  }
+  try {
+    const summary = await ipcRenderer.invoke('git-diff-summary', { cwd: s.cwd });
+    if (version !== environmentRefresh || s !== cur()) return;
+    $('environment-branch').textContent = summary.branch || branch || 'No branch';
+    $('workbench-branch').textContent = summary.branch ? `／ ${summary.branch}` : '';
+    $('environment-diffstat').innerHTML =
+      `<b>${summary.files || 0}</b><span>+${summary.additions || 0}</span><span class="deletions">−${summary.deletions || 0}</span>`;
+  } catch {
+    if (version === environmentRefresh) $('environment-diffstat').innerHTML = '<b>—</b>';
+  }
+}
+
+document.querySelectorAll('.workbench-tab').forEach(button => {
+  button.onclick = () => setWorkbenchMode(button.dataset.workbench);
+});
+document.querySelectorAll('[data-open-tool]').forEach(button => {
+  button.onclick = () => { setWorkbenchMode(button.dataset.openTool); closeToolLauncher(); };
+});
+$('launcher-open').onclick = openToolLauncher;
+$('tool-launcher-close').onclick = closeToolLauncher;
+toolOverlay.onclick = event => { if (event.target === toolOverlay) closeToolLauncher(); };
+$('terminal-focus').onclick = () => setWorkbenchMode('terminal');
+$('environment-review').onclick = () => setWorkbenchMode('review');
+$('environment-git-action').onclick = () => {
+  setWorkbenchMode('review');
+  setTimeout(() => $('git-message').focus(), 0);
+};
+$('environment-pr').onclick = openPullRequestDialog;
+$('environment-branch-row').onclick = () => openBranchMenu($('environment-branch-row'), 'up');
+$('environment-new-shell').onclick = () => startAuxTerminal();
+$('environment-terminal').onclick = () => { setWorkbenchMode('terminal'); startAuxTerminal(); };
+$('pr-cancel').onclick = closePullRequestDialog;
+$('pr-overlay').onclick = event => { if (event.target === $('pr-overlay')) closePullRequestDialog(); };
+$('pr-dialog').onsubmit = async event => {
+  event.preventDefault();
+  const s = sessions.get($('pr-overlay').dataset.sessionKey) || cur();
+  if (!s) return;
+  const title = $('pr-title').value.trim();
+  const base = $('pr-base').value.trim();
+  const body = $('pr-body').value.trim();
+  const branch = $('pr-head').textContent;
+  if (!title || !base) return;
+  if (!confirm(`Create this GitHub pull request?\n\n${branch} → ${base}\n${title}\n\nClide will not push or merge any commits.`)) return;
+  const submit = $('pr-submit');
+  const error = $('pr-dialog-error');
+  submit.disabled = true;
+  submit.textContent = 'Creating…';
+  error.className = '';
+  error.textContent = 'Publishing pull request with GitHub CLI…';
+  try {
+    const result = await ipcRenderer.invoke('git-pr-create', { cwd: s.cwd, title, body, base });
+    if (!result.ok) throw new Error(result.err || 'GitHub CLI could not create the pull request.');
+    error.className = 'success';
+    error.textContent = result.url ? `Created ${result.url}` : 'Pull request created.';
+    submit.textContent = 'Created';
+    if (result.url && confirm('Pull request created. Open it in your browser?')) ipcRenderer.send('open-external', result.url);
+  } catch (errorValue) {
+    error.textContent = errorValue.message;
+    submit.disabled = false;
+    submit.textContent = 'Create pull request';
+  }
+};
 
 /* ===================== git panel ===================== */
 const gitChanges = $('git-changes');
@@ -1421,12 +1752,13 @@ function basename(p) { return p.split('/').pop(); }
 function dirpart(p) { const i = p.lastIndexOf('/'); return i >= 0 ? p.slice(0, i) : ''; }
 function statusClass(c) { return ({ M: 'mod', '?': 'new', A: 'add', D: 'del', R: 'ren', U: 'con' })[c] || 'mod'; }
 
-async function loadGit() {
+async function loadGit({ selectFirst = false } = {}) {
   const s = cur(); if (!s) return;
   const st = await ipcRenderer.invoke('git-status', { cwd: s.cwd });
   if (!st || !st.repo) {
     $('git-branch').textContent = 'not a git repo'; $('git-aheadbehind').textContent = '';
     $('git-count').textContent = ''; gitChanges.innerHTML = '<div class="no-results">Not a git repository.</div>';
+    refreshEnvironment();
     return;
   }
   $('git-branch').textContent = st.branch || 'HEAD';
@@ -1434,9 +1766,16 @@ async function loadGit() {
   $('git-aheadbehind').textContent = ab;
   $('git-count').textContent = st.files.length ? ` ${st.files.length}` : '';
   gitChanges.innerHTML = '';
-  if (!st.files.length) { gitChanges.innerHTML = '<div class="no-results">No changes.</div>'; return; }
-  gitChanges.appendChild(gitZone('Staged', st.files.filter(f => f.staged), true, s));
-  gitChanges.appendChild(gitZone('Changes', st.files.filter(f => f.unstaged), false, s));
+  if (!st.files.length) { gitChanges.innerHTML = '<div class="no-results">No changes.</div>'; refreshEnvironment(); return; }
+  const staged = st.files.filter(f => f.staged);
+  const unstaged = st.files.filter(f => f.unstaged);
+  gitChanges.appendChild(gitZone('Staged', staged, true, s));
+  gitChanges.appendChild(gitZone('Changes', unstaged, false, s));
+  refreshEnvironment();
+  if (selectFirst && !s.viewerTabs.some(tab => tab.kind === 'diff')) {
+    const first = staged[0] || unstaged[0];
+    if (first) await openDiff(s, first.path, Boolean(first.staged));
+  }
 }
 function gitZone(label, files, isStaged, s) {
   const zone = document.createElement('div');
@@ -1542,7 +1881,7 @@ function doEdit(cmd) {
 }
 
 /* ===================== keyboard / zoom / notify ===================== */
-function toggleExplorer() { setExplorer(explorer.style.display === 'none'); }
+function toggleEnvironment() { setEnvironmentVisible(!environmentVisible); }
 let fontScale = 13;
 function applyZoom() {
   for (const s of sessions.values()) for (const t of s.terminals) t.term.options.fontSize = fontScale;
@@ -1564,21 +1903,31 @@ function notifyClaude(s) {
   s.unread = true; renderSessionTabs();
 }
 window.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && toolOverlay.style.display === 'flex') { closeToolLauncher(); return; }
+  if (e.key === 'Escape' && $('pr-overlay').style.display === 'flex') { closePullRequestDialog(); return; }
   if (e.key === 'Escape' && $('task-overlay').style.display === 'flex') { closeTaskDialog(); return; }
   if (e.ctrlKey && e.key === 'Tab') {
     e.preventDefault(); cycleTerminal(e.shiftKey ? -1 : 1); return;
   }
   const mod = e.metaKey || e.ctrlKey;
   if (!mod) return;
-  if (e.key === '\\') { e.preventDefault(); setLayout(layoutMode === 'focus' ? 'grid' : 'focus'); }
+  if (e.altKey && /^[1-3]$/.test(e.key)) {
+    e.preventDefault();
+    setWorkbenchMode(['review', 'terminal', 'files'][Number(e.key) - 1]);
+  }
+  else if (e.key === '\\') { e.preventDefault(); setLayout(layoutMode === 'focus' ? 'grid' : 'focus'); }
   else if (e.key.toLowerCase() === 'i') { e.preventDefault(); $('inspector-toggle').click(); }
   else if (e.shiftKey && /^[1-9]$/.test(e.key)) { const idx = +e.key - 1; const s = sessions.get(order[idx]); if (s) { e.preventDefault(); promptTaskMessage(s); } }
   else if (e.shiftKey && (e.key === 't' || e.key === 'T')) { e.preventDefault(); reopenClosed(); }
   else if (e.shiftKey && (e.key === 'j' || e.key === 'J')) { e.preventDefault(); startAuxTerminal(); }
   else if (e.key === 't') { e.preventDefault(); openHistory(); }
-  else if (e.key === 'p') { e.preventDefault(); setPanelMode('files'); if (explorer.style.display === 'none') toggleExplorer(); searchInput.focus(); searchInput.select(); }
-  else if (e.key === 'b') { e.preventDefault(); toggleExplorer(); }
-  else if (e.key === 'k') { e.preventDefault(); const t = activeTerminal(); if (t) t.term.clear(); }
+  else if (e.key === 'p') { e.preventDefault(); setWorkbenchMode('files'); searchInput.focus(); searchInput.select(); }
+  else if (e.key === 'b') { e.preventDefault(); toggleEnvironment(); }
+  else if (e.key === 'k') {
+    e.preventDefault();
+    if (e.shiftKey) { const t = activeTerminal(); if (t) t.term.clear(); }
+    else openToolLauncher();
+  }
   else if (e.key === '[') { e.preventDefault(); navGo(-1); }
   else if (e.key === ']') { e.preventDefault(); navGo(1); }
   else if (e.key === '=' || e.key === '+') { e.preventDefault(); zoom(1); }
@@ -1618,11 +1967,19 @@ function saveState() {
         title: s.title,
         tabs,
         active: act ? act.path : null,
-        shells: s.terminals.filter(t => t.kind === 'shell').map(t => ({ title: t.title, persistentId: t.persistentId })),
+        shells: s.terminals.filter(t => t.kind === 'shell' || t.kind === 'dev').map(t => ({ title: t.title, persistentId: t.persistentId, kind: t.kind })),
         activeTerminal: Math.max(0, s.terminals.findIndex(t => t.key === s.activeTerminalKey))
       };
     });
-    const state = { sessions: data, active: order.indexOf(activeKey), layout: layoutMode };
+    const state = {
+      sessions: data,
+      active: order.indexOf(activeKey),
+      layout: layoutMode,
+      workbench: workbenchMode,
+      explorerVisible,
+      inspectorVisible,
+      environmentVisible
+    };
     localStorage.setItem('clide-state', JSON.stringify(state));
     ipcRenderer.invoke('view-state-set', state).catch(() => {});
   } catch {}
@@ -1633,7 +1990,23 @@ async function loadState() {
 }
 window.addEventListener('beforeunload', saveState);
 
+async function restoreLiveSessions() {
+  let live = [];
+  try { live = await ipcRenderer.invoke('sessions-list'); } catch { return; }
+  for (const item of live || []) {
+    const existing = [...sessions.values()].find(session => session.key === item.key || (item.taskId && session.taskId === item.taskId) || (item.role === 'orchestrator' && session.role === 'orchestrator' && session.workspaceRoot === item.workspaceRoot));
+    if (existing) continue;
+    await startSession({ cwd: item.cwd, provider: item.provider, taskId: item.taskId, persistentId: item.persistentId, role: item.role, workspaceRoot: item.workspaceRoot, title: item.role === 'orchestrator' ? 'Repository Orchestrator' : (taskSnapshot.tasks[item.taskId] && taskSnapshot.tasks[item.taskId].title), restoreShells: item.shells });
+  }
+  const durable = Object.values(taskSnapshot.tasks || {}).filter(task => task.dispatch && task.dispatch.stage === 'running' && task.supervisorId && task.worktree && task.state !== 'archived');
+  for (const task of durable) {
+    if ([...sessions.values()].some(session => session.taskId === task.id)) continue;
+    await startSession({ cwd: task.worktree, provider: task.provider, taskId: task.id, persistentId: task.supervisorId, role: 'worker', recoverOnly: true, title: task.title });
+  }
+}
+
 /* ===================== boot ===================== */
+setWorkbenchMode(workbenchMode, { persist: false });
 (async () => {
   try { providerAvailability = await ipcRenderer.invoke('provider-availability'); } catch {}
   await refreshTaskSnapshot();
@@ -1659,20 +2032,29 @@ window.addEventListener('beforeunload', saveState);
         restoreTerminal: ss.activeTerminal
       });
     }
+    await restoreLiveSessions();
     if (!initial.noStart && ![...sessions.values()].some(session => session.role === 'orchestrator' && (session.workspaceRoot === initial.cwd || session.cwd === initial.cwd))) {
       const preferred = initial.defaultProvider === 'codex' ? 'codex' : 'claude';
       const provider = providerAvailability[preferred] ? preferred : (providerAvailability.claude ? 'claude' : 'codex');
       await startSession({ cwd: initial.cwd, provider, role: 'orchestrator', title: 'Repository Orchestrator', initialPrompt: 'Use $clide-orchestrate. Act as this repository orchestrator: keep the primary checkout stable, inspect Clide tasks, and dispatch implementation only to isolated workers.' });
     }
     if (saved.layout) setLayout(saved.layout);
+    if (WORKBENCH_MODES.has(saved.workbench)) workbenchMode = saved.workbench;
+    if (typeof saved.explorerVisible === 'boolean') explorerVisible = saved.explorerVisible;
+    if (typeof saved.inspectorVisible === 'boolean') inspectorVisible = saved.inspectorVisible;
+    if (typeof saved.environmentVisible === 'boolean') environmentVisible = saved.environmentVisible;
+    setWorkbenchMode(workbenchMode, { persist: false });
     if (saved.active >= 0 && order[saved.active]) switchSession(order[saved.active]);
+    await recoverDurableDispatches();
     return;
   }
   const { cwd, explicit, noStart } = initial;
+  await restoreLiveSessions();
   if (noStart) return;
   const preferred = initial.defaultProvider === 'codex' ? 'codex' : 'claude';
   const defaultProvider = providerAvailability[preferred] ? preferred : (providerAvailability.claude ? 'claude' : 'codex');
-  await startSession({ cwd, provider: defaultProvider, role: 'orchestrator', title: 'Repository Orchestrator', initialPrompt: 'Use $clide-orchestrate. Act as this repository orchestrator: keep the primary checkout stable, inspect Clide tasks, and dispatch implementation only to isolated workers.' });
+  if (![...sessions.values()].some(session => session.role === 'orchestrator' && (session.workspaceRoot === cwd || session.cwd === cwd))) await startSession({ cwd, provider: defaultProvider, role: 'orchestrator', title: 'Repository Orchestrator', initialPrompt: 'Use $clide-orchestrate. Act as this repository orchestrator: keep the primary checkout stable, inspect Clide tasks, and dispatch implementation only to isolated workers.' });
+  await recoverDurableDispatches();
   // First launch → open the welcome tab (intro + one-click skills install + map).
   if (!localStorage.getItem('clide-welcomed')) {
     const s = cur();

@@ -17,6 +17,7 @@ A task is ready only when:
 - changed paths and claims are understood;
 - dependency branches are ready or already integrated;
 - conflict preview is current.
+- the task audit trail contains no unresolved approval or launch failure.
 
 ## Review strategy
 
@@ -39,4 +40,3 @@ Present:
 - rollback/cleanup consequences.
 
 Request explicit confirmation for merge, push, PR publication, or worktree cleanup. Preserve branches and dirty work on failure.
-

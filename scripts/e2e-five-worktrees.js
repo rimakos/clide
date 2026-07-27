@@ -47,6 +47,12 @@ async function main() {
   const hunkRoot = created[0].cwd; const readme = path.join(hunkRoot, 'README.md');
   const changed = fs.readFileSync(readme, 'utf8').replace('fixture line 2', 'changed line 2').replace('fixture line 22', 'changed line 22');
   fs.writeFileSync(readme, changed);
+  const summary = await evaluate(`window.clide.ipc.invoke('git-diff-summary', { cwd: ${JSON.stringify(hunkRoot)} })`);
+  if (summary.files !== 1 || summary.additions < 2 || summary.deletions < 2) throw new Error(`Diff summary was incomplete: ${JSON.stringify(summary)}`);
+  const prPreview = await evaluate(`window.clide.ipc.invoke('git-pr-preview', { cwd: ${JSON.stringify(hunkRoot)}, base: 'main' })`);
+  if (!prPreview.ok || prPreview.branch !== 'clide/e2e-1' || prPreview.base !== 'main') throw new Error(`Pull request preview was incomplete: ${JSON.stringify(prPreview)}`);
+  const blockedPr = await evaluate(`window.clide.ipc.invoke('git-pr-create', { cwd: ${JSON.stringify(hunkRoot)}, base: 'main', title: 'Guarded test pull request', body: '' })`);
+  if (blockedPr.ok || !/never pushes implicitly/i.test(blockedPr.err || '')) throw new Error(`Unpublished branch was not guarded: ${JSON.stringify(blockedPr)}`);
   const diff = await evaluate(`window.clide.ipc.invoke('git-diff', { cwd: ${JSON.stringify(hunkRoot)}, file: 'README.md', staged: false })`);
   const lines = diff.split('\n'); const first = lines.findIndex(line => line.startsWith('@@')); const second = lines.findIndex((line, index) => index > first && line.startsWith('@@'));
   if (first < 0 || second < 0) throw new Error('Fixture did not create two review hunks.');
@@ -61,7 +67,7 @@ async function main() {
     if (!removed.ok) throw new Error(removed.err || 'Cleanup failed');
     await evaluate(`window.clide.ipc.invoke('task-remove', { id: ${JSON.stringify(item.task.id)} })`);
   }
-  console.log(JSON.stringify({ ok: true, worktrees: uniquePaths.size, ports: uniquePorts.size, providers: created.map(item => item.task.provider), durableTasks: 5, hunkStaging: true }));
+  console.log(JSON.stringify({ ok: true, worktrees: uniquePaths.size, ports: uniquePorts.size, providers: created.map(item => item.task.provider), durableTasks: 5, hunkStaging: true, diffSummary: true, prPreview: true, prPublishGuard: true }));
   socket.close(); child.kill('SIGTERM');
 }
 

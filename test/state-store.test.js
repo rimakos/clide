@@ -26,3 +26,26 @@ test('two store clients do not overwrite each other', () => {
   assert.equal(final.findings[0].body, 'from MCP');
   assert.equal(final.messages[0].body, 'from UI');
 });
+
+test('dispatch transitions are atomic and audited', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clide-dispatch-store-'));
+  const file = path.join(dir, 'state.db');
+  const first = new StateStore(file); const second = new StateStore(file);
+  const task = first.upsertTask({ title: 'Durable worker', repoRoot: '/repo', dispatch: { stage: 'worktree-created' } });
+  const claimed = first.transitionDispatch(task.id, { expected: 'worktree-created', to: 'setup-running', actor: 'renderer:a' });
+  assert.equal(claimed.ok, true);
+  const stale = second.transitionDispatch(task.id, { expected: 'worktree-created', to: 'launching', actor: 'renderer:b' });
+  assert.equal(stale.conflict, true);
+  const final = second.snapshot().tasks[task.id];
+  assert.equal(final.dispatch.stage, 'setup-running');
+  assert.equal(final.audit.at(-1).from, 'worktree-created');
+  assert.equal(final.audit.at(-1).to, 'setup-running');
+});
+
+test('state store protects its directory and database', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clide-permissions-'));
+  const home = path.join(dir, 'private'); const file = path.join(home, 'state.db');
+  const db = new StateStore(file); db.close();
+  assert.equal(fs.statSync(home).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+});

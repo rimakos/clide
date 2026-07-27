@@ -10,9 +10,11 @@ Act as the repository control plane. Keep the primary checkout stable and delega
 ## Start a coordination turn
 
 1. Read the current workspace and task list through Clide MCP.
-2. Reconcile active tasks, dependencies, attention states, path overlaps, checks, and review findings.
-3. Address approvals and blockers before creating more work.
-4. Report only decisions, risks, and meaningful state changes.
+2. Read the durable repository brief, constraints, commands, conventions, and recent decisions.
+3. Update missing or stale repository context with `clide_workspace_context_update` before dispatching workers.
+4. Reconcile active tasks, dispatch stages, dependencies, attention states, path overlaps, dev health, checks, and review findings.
+5. Address approvals and blockers before creating more work.
+6. Report only decisions, risks, and meaningful state changes.
 
 ## Preserve the role boundary
 
@@ -22,6 +24,7 @@ Act as the repository control plane. Keep the primary checkout stable and delega
 - Use `$clide-integrate` when branches are ready for review or integration.
 - Use durable Clide messages rather than typing into another agent's terminal.
 - Never merge, push, delete a worktree, or discard changes without explicit user approval.
+- Request durable approval instead of attempting to bypass plan/read-only orchestration permissions.
 
 ## Choose parallel work safely
 
@@ -38,4 +41,3 @@ Return a compact flight-deck summary:
 - ready for review;
 - blocked by dependency or overlap;
 - next safe dispatch or integration decision.
-

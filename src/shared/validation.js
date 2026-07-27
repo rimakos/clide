@@ -1,4 +1,5 @@
 const path = require('path');
+const { normalizeDispatch } = require('./dispatch-lifecycle');
 
 const TASK_STATES = new Set([
   'draft', 'starting', 'running', 'waiting', 'approval', 'blocked', 'done', 'exited', 'archived'
@@ -53,6 +54,19 @@ function normalizeTask(input = {}) {
     createdBy: text(input.createdBy, 80),
     dispatchKey: text(input.dispatchKey, 160),
     promptDeliveredAt: text(input.promptDeliveredAt, 40),
+    dispatch: normalizeDispatch(input.dispatch),
+    dev: input.dev && typeof input.dev === 'object' ? {
+      status: text(input.dev.status, 40) || 'idle',
+      terminalId: text(input.dev.terminalId, 160),
+      startedAt: text(input.dev.startedAt, 40),
+      healthyAt: text(input.dev.healthyAt, 40),
+      lastCheckedAt: text(input.dev.lastCheckedAt, 40),
+      lastError: text(input.dev.lastError, 1000),
+      url: text(input.dev.url, 500)
+    } : null,
+    contextSnapshot: text(input.contextSnapshot, 12000),
+    approvals: Array.isArray(input.approvals) ? input.approvals.slice(-100) : [],
+    audit: Array.isArray(input.audit) ? input.audit.slice(-500) : [],
     createdAt: input.createdAt || now,
     updatedAt: now
   };

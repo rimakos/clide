@@ -1,6 +1,8 @@
 # Clide repository orchestrator
 
-Status: implemented and verified on 2026-07-21
+Status: initial orchestrator milestone implemented and verified on 2026-07-21.
+The recovery, scheduling, Inbox, and safety continuation is documented in
+[CLIDE_DURABLE_ORCHESTRATION_PLAN.md](CLIDE_DURABLE_ORCHESTRATION_PLAN.md).
 
 ## Product decision
 
@@ -51,4 +53,3 @@ Codex with `npm run setup-os -- --orchestrator`.
 - Duplicate dispatch is asserted idempotent.
 - Repository scoping, pinned identity, durable creator metadata, and cleanup are asserted.
 - Existing five-worktree mixed-provider and hunk-staging regression suite remains green.
-

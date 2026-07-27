@@ -5,6 +5,8 @@ const os = require('os');
 const readline = require('readline');
 const http = require('http');
 const { StateStore } = require('../src/main/state-store');
+const { normalizeClaim } = require('../src/main/path-claims');
+const { normalizeWorkspaceContext } = require('../src/shared/workspace-context');
 
 const stateFile = process.env.CLIDE_STATE_FILE || path.join(os.homedir(), '.clide', 'state.db');
 const defaultTaskId = process.env.CLIDE_TASK_ID || '';
@@ -22,6 +24,7 @@ const tools = [
   { name: 'clide_task_get', description: 'Read one Clide task, including dependencies, findings, messages, and checks.', inputSchema: { type: 'object', properties: { taskId: { type: 'string' } } } },
   { name: 'clide_tasks_list', description: 'List Clide tasks in the local coordination store.', inputSchema: { type: 'object', properties: { repoRoot: { type: 'string' } } } },
   { name: 'clide_workspace_get', description: 'Read the orchestrator workspace and all repository tasks.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'clide_workspace_context_update', description: 'Update the durable repository brief used for future workers. Orchestrator sessions only.', inputSchema: { type: 'object', properties: { summary: { type: 'string' }, constraints: { type: 'array', items: { type: 'string' } }, commands: { type: 'array', items: { type: 'string' } }, conventions: { type: 'array', items: { type: 'string' } }, decision: { type: 'object', properties: { title: { type: 'string' }, body: { type: 'string' } } } } } },
   { name: 'clide_dispatch_task', description: 'Create and launch one isolated Claude or Codex worker in the orchestrator repository. Retries with the same dispatchKey are idempotent.', inputSchema: { type: 'object', required: ['title', 'prompt'], properties: {
     ticket: { type: 'string' }, title: { type: 'string' }, prompt: { type: 'string' }, provider: { enum: ['claude', 'codex'] },
     branch: { type: 'string' }, baseRef: { type: 'string' }, setupCommand: { type: 'string' }, devCommand: { type: 'string' },
@@ -33,6 +36,7 @@ const tools = [
   , { name: 'clide_claim_paths', description: 'Declare files or globs this task expects to modify so other agents can avoid collisions.', inputSchema: { type: 'object', required: ['paths'], properties: { taskId: { type: 'string' }, paths: { type: 'array', items: { type: 'string' }, maxItems: 100 }, note: { type: 'string' } } } }
   , { name: 'clide_publish_artifact', description: 'Publish a durable task artifact such as a plan, report, screenshot, or build output.', inputSchema: { type: 'object', required: ['path'], properties: { taskId: { type: 'string' }, path: { type: 'string' }, kind: { type: 'string' }, label: { type: 'string' } } } }
   , { name: 'clide_set_state', description: 'Set this task lifecycle state.', inputSchema: { type: 'object', required: ['state'], properties: { taskId: { type: 'string' }, state: { enum: ['running', 'waiting', 'approval', 'blocked', 'done'] } } } }
+  , { name: 'clide_request_approval', description: 'Request a durable user approval for a risky or repository-wide action.', inputSchema: { type: 'object', required: ['title', 'body'], properties: { taskId: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' }, command: { type: 'string' } } } }
 ];
 
 function postCommand(command) {
@@ -54,6 +58,14 @@ async function call(name, args = {}) {
   if (name === 'clide_workspace_get') {
     const db = store(); return result({ workspace: db.state.workspaces[workspaceRoot] || { root: workspaceRoot }, tasks: db.listTasks(workspaceRoot) });
   }
+  if (name === 'clide_workspace_context_update') {
+    if (process.env.CLIDE_ROLE !== 'orchestrator') throw new Error('Only the repository orchestrator can update workspace context.');
+    const db = store(); const workspace = db.state.workspaces[workspaceRoot] || { root: workspaceRoot };
+    const current = workspace.context || {}; const decisions = [...(current.decisions || [])];
+    if (args.decision && (args.decision.title || args.decision.body)) decisions.push({ id: `${Date.now()}-${process.pid}`, title: args.decision.title, body: args.decision.body, at: new Date().toISOString(), by: process.env.CLIDE_SESSION || 'orchestrator' });
+    const context = normalizeWorkspaceContext({ ...current, ...args, decisions, updatedAt: new Date().toISOString(), updatedBy: process.env.CLIDE_SESSION || 'orchestrator' });
+    return result(db.upsertWorkspace(workspaceRoot, { context }).context);
+  }
   if (name === 'clide_dispatch_task') return result(await postCommand({ type: 'dispatch-task', ...args }));
   const current = task(args.taskId);
   const db = store();
@@ -71,9 +83,13 @@ async function call(name, args = {}) {
     return result(db.patchTask(current.id, { checks: [...current.checks, entry] }));
   }
   if (name === 'clide_claim_paths') {
-    const paths = Array.isArray(args.paths) ? args.paths.map(value => String(value).trim().slice(0, 4096)).filter(Boolean).slice(0, 100) : [];
+    const paths = Array.isArray(args.paths) ? args.paths.map(normalizeClaim).slice(0, 100) : [];
     const claims = paths.map(value => ({ id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, path: value, note: String(args.note || '').slice(0, 500), from: defaultTaskId || 'agent', at }));
     return result(db.patchTask(current.id, { pathClaims: [...current.pathClaims, ...claims] }));
+  }
+  if (name === 'clide_request_approval') {
+    const entry = { id: `${Date.now()}-${process.pid}`, title: String(args.title).slice(0, 200), body: String(args.body).slice(0, 4000), command: String(args.command || '').slice(0, 1000), status: 'pending', requestedAt: at, requestedBy: defaultTaskId || 'agent' };
+    return result(db.appendTaskAudit(current.id, { type: 'approval-requested', actor: entry.requestedBy, reason: entry.title }, { approvals: [...current.approvals, entry], state: 'approval' }));
   }
   if (name === 'clide_publish_artifact') {
     const entry = { id: `${Date.now()}-${process.pid}`, path: String(args.path).slice(0, 4096), kind: String(args.kind || 'file').slice(0, 40), label: String(args.label || '').slice(0, 160), from: defaultTaskId || 'agent', at };

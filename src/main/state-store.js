@@ -2,8 +2,9 @@ const fs = require('fs');
 const path = require('path');
 const { DatabaseSync } = require('node:sqlite');
 const { normalizeTask } = require('../shared/validation');
+const { assertTransition, normalizeDispatch } = require('../shared/dispatch-lifecycle');
 
-const CURRENT_VERSION = 2;
+const CURRENT_VERSION = 3;
 const EMPTY = { version: CURRENT_VERSION, workspaces: {}, tasks: {}, layoutByWorkspace: {}, settings: {} };
 
 function parse(value, fallback = null) {
@@ -14,12 +15,15 @@ class StateStore {
   constructor(file, options = {}) {
     this.file = file;
     this.legacyFile = options.legacyFile || (file.endsWith('.db') ? file.replace(/\.db$/, '.json') : null);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.chmodSync(path.dirname(file), 0o700);
     this.db = new DatabaseSync(file);
+    fs.chmodSync(file, 0o600);
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;');
     this.migrate();
     this.state = this.readAll();
     this.importLegacyIfEmpty();
+    for (const suffix of ['', '-wal', '-shm']) { const candidate = `${file}${suffix}`; if (fs.existsSync(candidate)) fs.chmodSync(candidate, 0o600); }
   }
 
   migrate() {
@@ -35,6 +39,10 @@ class StateStore {
     if (version < 1) this.db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','1')").run();
     if (version < 2) {
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(json_extract(data, '$.updatedAt'));");
+      this.db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','2')").run();
+    }
+    if (version < 3) {
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_dispatch_stage ON tasks(json_extract(data, '$.dispatch.stage'));");
       this.db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)").run(String(CURRENT_VERSION));
     }
   }
@@ -114,6 +122,67 @@ class StateStore {
       this.db.prepare('INSERT OR REPLACE INTO tasks(id,data) VALUES(?,?)').run(id, JSON.stringify(task));
       this.db.exec('COMMIT'); this.state.tasks[id] = task; return structuredClone(task);
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  appendTaskAudit(id, entry = {}, patch = {}) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.db.prepare('SELECT data FROM tasks WHERE id=?').get(id);
+      if (!row) throw new Error('Task not found.');
+      const previous = parse(row.data, {}); const at = entry.at || new Date().toISOString();
+      const audit = [...(previous.audit || []), {
+        id: entry.id || `audit-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+        type: String(entry.type || 'event').slice(0, 80), actor: String(entry.actor || 'clide').slice(0, 160),
+        reason: String(entry.reason || '').slice(0, 1000), at
+      }].slice(-500);
+      const task = normalizeTask({ ...previous, ...patch, id, audit, createdAt: previous.createdAt });
+      this.db.prepare('INSERT OR REPLACE INTO tasks(id,data) VALUES(?,?)').run(id, JSON.stringify(task));
+      this.db.exec('COMMIT'); this.state.tasks[id] = task; return structuredClone(task);
+    } catch (error) { try { this.db.exec('ROLLBACK'); } catch {} throw error; }
+  }
+
+  transitionDispatch(id, transition = {}) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.db.prepare('SELECT data FROM tasks WHERE id=?').get(id);
+      if (!row) throw new Error('Task not found.');
+      const previous = parse(row.data, {});
+      const current = normalizeDispatch(previous.dispatch);
+      if (!current) throw new Error('Task has no durable dispatch.');
+      const expected = Array.isArray(transition.expected) ? transition.expected : [transition.expected].filter(Boolean);
+      if (expected.length && !expected.includes(current.stage)) {
+        this.db.exec('ROLLBACK');
+        return { ok: false, conflict: true, stage: current.stage, task: normalizeTask(previous) };
+      }
+      const to = transition.to || current.stage;
+      assertTransition(current.stage, to);
+      const at = new Date().toISOString();
+      const dispatch = normalizeDispatch({
+        ...current,
+        ...(transition.patch || {}),
+        stage: to,
+        revision: current.revision + 1,
+        updatedAt: at,
+        lastActor: transition.actor || 'clide'
+      });
+      const audit = [...(previous.audit || []), {
+        id: transition.eventId || `dispatch-${id}-${dispatch.revision}`,
+        type: 'dispatch-transition',
+        from: current.stage,
+        to,
+        actor: dispatch.lastActor,
+        reason: String(transition.reason || '').slice(0, 1000),
+        at
+      }].slice(-500);
+      const task = normalizeTask({ ...previous, ...(transition.taskPatch || {}), id, dispatch, audit, createdAt: previous.createdAt });
+      this.db.prepare('INSERT OR REPLACE INTO tasks(id,data) VALUES(?,?)').run(id, JSON.stringify(task));
+      this.db.exec('COMMIT');
+      this.state.tasks[id] = task;
+      return { ok: true, task: structuredClone(task), dispatch: structuredClone(dispatch) };
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch {}
+      throw error;
+    }
   }
 
   removeTask(id) {
