@@ -1,0 +1,28 @@
+#!/usr/bin/env node
+const http = require('http');
+const fs = require('fs');
+
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => { input += chunk; if (input.length > 256 * 1024) process.exit(0); });
+process.stdin.on('end', () => {
+  let event = {};
+  try { event = input.trim() ? JSON.parse(input) : {}; } catch { event = { type: 'invalid-hook-payload' }; }
+  const payload = JSON.stringify({
+    secret: process.env.CLIDE_SECRET || '', taskId: process.env.CLIDE_TASK_ID || '',
+    session: process.env.CLIDE_SESSION || '', terminal: process.env.CLIDE_TERMINAL || '',
+    provider: process.env.CLIDE_PROVIDER || '', event
+  });
+  if (process.env.CLIDE_HOOK_CAPTURE_FILE) {
+    try { fs.writeFileSync(process.env.CLIDE_HOOK_CAPTURE_FILE, payload, { mode: 0o600 }); } catch {}
+    return process.exit(0);
+  }
+  const socketPath = process.env.CLIDE_SOCKET;
+  if (!socketPath) return process.exit(0);
+  const request = http.request({ socketPath, path: '/event', method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } }, response => {
+    response.resume(); response.on('end', () => process.exit(0));
+  });
+  request.setTimeout(1500, () => request.destroy());
+  request.on('error', () => process.exit(0));
+  request.end(payload);
+});

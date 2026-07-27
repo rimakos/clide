@@ -1,73 +1,131 @@
-# Clide — Claude terminal IDE
+# Clide — the Claude + Codex branch flight deck
 
-Two-pane macOS app: a real terminal running `claude` on the left, a typed
-side-panel viewer on the right. When Claude runs `open <file>`, the file shows
-up in a tab rendered by type (email/text editable, markdown rendered⇄raw, code,
-image) with a clean **Copy** button so you paste in the right format instead of
-fighting terminal copy-paste.
+Clide is a focused macOS IDE for supervising several Claude Code and Codex tasks
+without putting them in the same checkout. One task owns one Git worktree, one
+branch, one agent session, a durable coordination record, and as many ordinary
+shell terminals as you need.
 
-## Bundled agentic-dev-os
+## Daily workflow
 
-Clide ships the **agentic-dev-os** — a portable, multi-repo agentic workflow packaged
-as a Claude Code plugin (lifecycle skills + a knowledge wiki). It lives in
-[`agentic-dev-os/`](agentic-dev-os/) — see its [README](agentic-dev-os/README.md).
-On your first launch, Clide opens its clickable map
-([`agentic-dev-os/docs/visualiser.html`](agentic-dev-os/docs/visualiser.html)) as the
-first tab so you can see the whole flow, the skills, and what fires when.
+1. Open a repository with `clide .`.
+2. Choose **New isolated task**, enter a ticket/title, provider, and optional setup
+   and dev commands.
+3. Clide creates a worktree under `~/.clide/worktrees`, assigns a free dev port,
+   runs setup, starts Claude or Codex, and optionally starts the dev command in its
+   own terminal.
+4. Use the single, two-column, two-row, or four-pane layout to supervise tasks.
+5. Review dependencies, child agents, lifecycle events, path claims, artifacts,
+   messages, checks, changed-file overlap, and dry conflict previews in the inspector.
+6. Merge only through the explicit guarded integration action. Clide requires a
+   clean target checkout and clean preview, and never pushes automatically.
 
-It's **optional** — Clide works fully without it. The Welcome tab has a one-click
-**Install** button; or run `npm run setup-os` (or `./bin/install --with-os`). All copy
-the skills into `~/.claude/skills`. Not interested? Ignore it — nothing touches your
-Claude config unless you ask.
+Each agent pane has **+ Shell** for dev servers, tests, logs, database commands, or
+anything else in that exact worktree. `⌘⇧J` opens a shell, `Ctrl+Tab` cycles that
+task's terminals, and a shell can be renamed by double-clicking its tab.
 
-> Browse the map on GitHub:
-> [github.com/rimakos/clide/blob/main/agentic-dev-os/docs/visualiser.html](https://github.com/rimakos/clide/blob/main/agentic-dev-os/docs/visualiser.html)
-> — or clone and open it in a browser for the interactive version.
+## Repository orchestrator
 
-## Install (first time)
+The first session for a repository is its pinned **Repository Orchestrator**. It can
+be Claude or Codex and receives workspace-scoped Clide MCP tools. Ask it to dispatch
+a ticket and it will define the branch, provider, prompt, commands, dependencies,
+and path claims; Clide then creates and launches the isolated worker automatically.
+The orchestrator coordinates the primary checkout but does not implement worker
+tickets there. Dispatch is durable across reloads, provider startup and prompt
+delivery are acknowledged separately, and uncertain delivery requires an explicit
+operator decision. A setup command written by the orchestrator is arbitrary shell,
+so it never runs unattended: the worker parks at `waiting-approval` and the command
+appears in the Approvals panel for you to approve or reject first. See
+[CLIDE_DURABLE_ORCHESTRATION_PLAN.md](docs/CLIDE_DURABLE_ORCHESTRATION_PLAN.md).
 
-macOS, Node 18+, and the `claude` CLI on your PATH. One command:
+## Flight-deck features
+
+- Claude Code and Codex provider adapters with resume support and CLI detection.
+- Isolated Git worktrees with duplicate branch ownership protection,
+  `.worktreeinclude`, setup commands, and safe cleanup checks.
+- Four-pane agent grid, focus mode, attention states, task rail, and collapsible
+  inspector.
+- Per-task dev ports and optional automatic dev-server terminals.
+- A durable dispatch state machine with revision-checked transitions, renderer
+  leases, bounded retries, exactly-once launch guards, and reload recovery.
+- Dependency scheduling with cycle detection and a configurable per-repository worker
+  limit, plus glob-aware path-claim risk before launch.
+- An Inbox for lifecycle recovery, approvals, audit history, dev health, and a durable
+  repository brief whose bounded snapshot is delivered to each worker.
+- Transactional local tasks, findings, messages, checks, layout, metrics, and recovery
+  state in `~/.clide/state.db`, including automatic migration from the old JSON store.
+- A local Clide MCP server, automatically scoped into isolated Claude and Codex
+  sessions, so either provider can publish findings and check results.
+- Native Claude hooks and Codex notifications for attention and child-agent state.
+- Dependencies, path claims, artifacts, changed-path overlap, checks at a commit SHA,
+  hunk staging, independent AI review, and disposable combined-test integration.
+- Detached agent and shell processes that reattach after Clide restarts.
+- Credential-free workspace backup/restore, local-only workflow metrics, signed
+  release automation, in-app updates, release channels, and rollback metadata.
+- Typed text, Markdown, code, image, HTML-sandbox, and Git diff viewers.
+- A setup doctor, authenticated Unix-socket `open`/event shim, single-instance launcher,
+  secure Electron preload boundary, file-size limits, and worktree-scoped file IPC.
+
+## Install and run
+
+Requirements: macOS, Node.js 22.12+, Git, and at least one of `claude` or `codex` on
+your login-shell PATH.
 
 ```bash
 git clone https://github.com/rimakos/clide.git
 cd clide
 ./bin/install
+clide .
 ```
 
-Full steps, manual install, update, and troubleshooting: see [INSTALL.md](INSTALL.md).
-
-## Run
+Development:
 
 ```bash
-clide .                  # open current folder
-clide ~/some/repo
+npm install
+npm run rebuild
+npm run check
+npm start
 ```
 
-Or run directly without installing the launcher:
+Use `npm run doctor` for a JSON environment report. See [INSTALL.md](INSTALL.md) for
+manual installation and troubleshooting.
 
-```bash
-CLIDE_CWD=/path/to/repo npx electron .
-```
+## Keyboard shortcuts
 
-## How it works
+| Shortcut | Action |
+|---|---|
+| `⌘T` | sessions and history |
+| `⌘⇧J` | shell in the active task |
+| `Ctrl+Tab` | next terminal inside the task |
+| `⌘1…9` | focus an agent |
+| `⌘⇧1…9` | queue a message for an agent |
+| `⌘\` | grid/focus toggle |
+| `⌘I` | inspector toggle |
+| `⌘B` | task/file rail toggle |
+| `⌘P` | file search |
 
-The terminal launches `claude` with `PATH` prepended by `shim/open`. That shim
-catches any `open` Claude runs, resolves the path, and tells the app to open a
-tab. URLs and missing files fall through to the real `/usr/bin/open`, so browser
-links still work. Nothing reaches the real TextEdit.
+## Agentic-dev-os
 
-## Viewers
+The optional [agentic-dev-os](agentic-dev-os/) supplies lifecycle and workspace-wiki
+skills. The Welcome action and `npm run setup-os` install the same canonical skills
+for both Claude (`~/.claude/skills`) and Codex (`~/.agents/skills`). Nothing is
+installed globally unless you choose that action.
 
-| File | Viewer | Copy |
-|---|---|---|
-| `.txt`, `.eml`, none | editable mono text | raw text |
-| `.md` | Rendered ⇄ Raw toggle | rich HTML or raw source |
-| code (`.js .ts .py .json …`) | editable mono | exact code |
-| images (`.png .jpg .svg …`) | preview | copy image / reveal in Finder |
+Repository orchestrators use the bundled `clide-orchestrate`, `clide-dispatch`,
+`clide-supervise`, and `clide-integrate` skills. Install only those four without
+touching other bundled skills using `npm run setup-os -- --orchestrator`.
 
-`⌘S` saves edits back to the file (asks once before the first overwrite).
+Claude orchestrators start in plan mode and Codex orchestrators start in a read-only
+sandbox. Both coordinate through repository-scoped Clide tools and request approval
+for consequential operations.
 
-## Config
+## Safety model
 
-- `CLIDE_PORT` (default `8771`) — localhost port the shim talks to.
-- `CLIDE_CWD` — folder to open (set by the `clide` launcher).
+The renderer has no Node.js access. It talks through an allowlisted preload API;
+filesystem operations are constrained to granted workspaces, HTML previews are
+script-disabled, external navigation is denied by default, and the file-open shim
+uses a private local Unix socket and stable secret. Clide never silently stages
+everything, commits, pushes, force-removes a dirty worktree, or integrates without a
+named user action.
+
+Clide state and coordination stay local. Provider authentication and transcripts
+remain owned by their official CLIs.

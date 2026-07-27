@@ -2,6 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'" />
   <link rel="stylesheet" href="../node_modules/@xterm/xterm/css/xterm.css" />
   <link rel="stylesheet" id="hljs-theme" href="../node_modules/highlight.js/styles/atom-one-dark.css" />
   <link rel="stylesheet" href="style.css" />
@@ -9,31 +10,127 @@
 </head>
 <body>
   <div id="session-bar">
+    <div id="brand"><span class="brand-mark">⌘</span><span>CLIDE</span></div>
     <div id="session-tabs"></div>
+    <div id="flight-controls">
+      <button id="attention-toggle" type="button" title="Attention inbox"><span class="attention-dot"></span> Attention <b id="attention-count">0</b></button>
+      <div id="layout-controls" aria-label="Terminal layout">
+        <button data-layout="single" title="Single pane">1</button>
+        <button data-layout="two-cols" title="Two columns">2│</button>
+        <button data-layout="two-rows" title="Two rows">2—</button>
+        <button data-layout="grid" title="Four-pane grid">4</button>
+        <button data-layout="focus" title="Focus active pane (⌘\)">Focus</button>
+      </div>
+    </div>
     <button id="new-session" title="History &amp; new chat (⌘T)">
       <svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 3v10 M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
     </button>
   </div>
 
+  <nav id="workbench-bar" aria-label="Workbench tools">
+    <div id="workbench-tabs" role="tablist" aria-label="Open tools">
+      <button class="workbench-tab" data-workbench="review" type="button" role="tab" aria-selected="false">
+        <svg viewBox="0 0 18 18" aria-hidden="true"><rect x="3" y="2.5" width="12" height="13" rx="3"/><path d="M6.5 6.5h5M6.5 9h3.5M6.5 12h4.5"/></svg>
+        <span>Review</span>
+      </button>
+      <button class="workbench-tab active" data-workbench="terminal" type="button" role="tab" aria-selected="true">
+        <svg viewBox="0 0 18 18" aria-hidden="true"><rect x="2.5" y="3" width="13" height="12" rx="3"/><path d="m5.5 7 2 2-2 2M9.5 11h3"/></svg>
+        <span>Terminal</span>
+      </button>
+      <button class="workbench-tab" data-workbench="files" type="button" role="tab" aria-selected="false">
+        <svg viewBox="0 0 18 18" aria-hidden="true"><path d="M2.5 5.5a2 2 0 0 1 2-2H8l1.4 1.5h4.1a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2z"/></svg>
+        <span>Files</span>
+      </button>
+      <button id="launcher-open" type="button" title="Open tool launcher (⌘K)" aria-label="Open tool launcher">
+        <svg viewBox="0 0 18 18" aria-hidden="true"><path d="M9 3v12M3 9h12"/></svg>
+      </button>
+    </div>
+    <div id="workbench-context">
+      <span id="workbench-repo">No workspace</span>
+      <span id="workbench-branch"></span>
+    </div>
+    <div id="pane-controls" aria-label="Pane visibility">
+      <button id="sidebar-toggle-top" type="button" title="Toggle environment (⌘B)" aria-label="Toggle environment">
+        <svg viewBox="0 0 18 18" aria-hidden="true"><rect x="2.5" y="3" width="13" height="12" rx="3"/><path d="M6.5 3v12"/></svg>
+      </button>
+      <button id="terminal-focus" type="button" title="Show terminal workspace" aria-label="Show terminal workspace">
+        <svg viewBox="0 0 18 18" aria-hidden="true"><rect x="2.5" y="3" width="13" height="12" rx="3"/><path d="M5.5 11h7"/></svg>
+      </button>
+      <button id="inspector-toggle" type="button" title="Toggle context panel (⌘I)" aria-label="Toggle context panel">
+        <svg viewBox="0 0 18 18" aria-hidden="true"><rect x="2.5" y="3" width="13" height="12" rx="3"/><path d="M11.5 3v12"/></svg>
+      </button>
+    </div>
+  </nav>
+
   <div id="main">
+    <aside id="environment-sidebar" aria-label="Environment">
+      <section id="environment-card" aria-labelledby="environment-title">
+        <div class="environment-head">
+          <span id="environment-title">Environment</span>
+          <button id="environment-new-shell" type="button" title="New background terminal" aria-label="New background terminal">+</button>
+        </div>
+        <button class="environment-row" id="environment-review" type="button">
+          <span class="environment-icon">±</span>
+          <span class="environment-label">Changes</span>
+          <span id="environment-diffstat"><b>0</b></span>
+        </button>
+        <div class="environment-row environment-static">
+          <span class="environment-icon">⌁</span>
+          <span class="environment-label">Local</span>
+          <span class="environment-value" id="environment-local">ready</span>
+        </div>
+        <button class="environment-row" id="environment-branch-row" type="button">
+          <span class="environment-icon branch-node"></span>
+          <span class="environment-label environment-branch-label" id="environment-branch">No branch</span>
+          <span class="environment-chevron">›</span>
+        </button>
+        <button class="environment-row" id="environment-git-action" type="button">
+          <span class="environment-icon">◉</span>
+          <span class="environment-label">Commit or push</span>
+        </button>
+        <button class="environment-row" id="environment-pr" type="button">
+          <span class="environment-icon pr-mark">⌁</span>
+          <span class="environment-label">Create pull request</span>
+        </button>
+        <div class="environment-rule"></div>
+        <button class="environment-row" id="environment-terminal" type="button">
+          <span class="environment-icon">›_</span>
+          <span class="environment-label">Background terminal</span>
+        </button>
+      </section>
+    </aside>
+
     <div id="explorer">
       <div id="explorer-head">
         <div id="panel-tabs">
-          <span class="ptab active" data-mode="files" title="Files (⌘B)">Files</span>
-          <span class="ptab" data-mode="git" title="Source control">Git<span id="git-count"></span></span>
+          <button class="ptab" data-mode="files" type="button" title="Files (⌘P)">Files</button>
+          <button class="ptab active" data-mode="tasks" type="button" title="Tasks and worktrees">Tasks</button>
+          <button class="ptab" data-mode="git" type="button" title="Source control">Git<span id="git-count"></span></button>
         </div>
-        <span id="explorer-toggle" title="Hide panel (⌘B)">
-          <svg viewBox="0 0 16 16" width="14" height="14"><path d="M10 4 L6 8 L10 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </span>
+        <button id="explorer-toggle" type="button" title="Hide navigator" aria-label="Hide navigator">
+          <svg viewBox="0 0 16 16" width="14" height="14"><path d="M6 4 L10 8 L6 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+
+      <div id="tasks-pane">
+        <div id="task-actions">
+          <button id="task-new" type="button">New isolated task</button>
+          <button id="task-import" type="button" title="Import a JSON array of tickets">Import</button>
+          <button id="workspace-backup" type="button" title="Export or restore Clide task state">Backup</button>
+          <button id="task-metrics" type="button" title="Private local workflow metrics">Metrics</button>
+          <button id="app-update" type="button" title="Check for signed updates">Update</button>
+          <button id="task-doctor" type="button" title="Check local setup">Doctor</button>
+        </div>
+        <div id="task-list"></div>
       </div>
 
       <div id="files-pane">
         <div id="search-wrap">
           <svg class="search-icon" viewBox="0 0 16 16" width="13" height="13"><circle cx="7" cy="7" r="4.2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10.2 10.2 L13.5 13.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
           <input id="search" type="text" placeholder="Search files (⌘P)" spellcheck="false" autocomplete="off" />
-          <span id="search-clear" title="Clear">
+          <button id="search-clear" type="button" title="Clear" aria-label="Clear file search">
             <svg viewBox="0 0 16 16" width="12" height="12"><path d="M4 4 L12 12 M12 4 L4 12" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-          </span>
+          </button>
         </div>
         <div id="tree"></div>
         <div id="results"></div>
@@ -43,9 +140,9 @@
         <div id="git-branch-row">
           <span id="git-branch">—</span>
           <span id="git-aheadbehind"></span>
-          <span id="git-refresh" title="Refresh">
+          <button id="git-refresh" type="button" title="Refresh" aria-label="Refresh source control">
             <svg viewBox="0 0 16 16" width="13" height="13"><path d="M13 8a5 5 0 11-1.5-3.5 M13 2v3h-3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          </span>
+          </button>
         </div>
         <div id="git-commit-box">
           <textarea id="git-message" rows="2" placeholder="Commit message" spellcheck="false"></textarea>
@@ -58,32 +155,48 @@
       </div>
     </div>
     <div id="divider-left"></div>
-    <div id="explorer-show" title="Show files (⌘B)">
-      <svg viewBox="0 0 16 16" width="14" height="14"><path d="M6 4 L10 8 L6 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    </div>
+    <button id="explorer-show" type="button" title="Show navigator" aria-label="Show navigator">
+      <svg viewBox="0 0 16 16" width="14" height="14"><path d="M10 4 L6 8 L10 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
 
-    <div id="terminals"></div>
+    <div id="terminal-column">
+      <div id="workspace-toolbar">
+        <span id="workspace-label">Branch flight deck</span>
+        <span id="workspace-summary">Each task owns one worktree.</span>
+        <span class="toolbar-spacer"></span>
+        <button id="workspace-orchestrator" type="button">◆ Orchestrator</button>
+        <button id="workspace-new-task" type="button">+ Isolated task</button>
+      </div>
+      <div id="terminals"></div>
+    </div>
     <div id="divider"></div>
 
     <div id="right">
+      <div id="inspector-tabs">
+        <button data-inspector="files" class="active">Files</button>
+        <button data-inspector="messages">Inbox</button>
+        <button data-inspector="checks">Checks</button>
+        <button data-inspector="integrate">Integrate</button>
+      </div>
       <div id="viewer-nav">
-        <span class="nav-btn" id="nav-back" title="Back (⌘[)">
+        <button class="nav-btn" id="nav-back" type="button" title="Back (⌘[)" aria-label="Back">
           <svg viewBox="0 0 16 16" width="15" height="15"><path d="M10 3 L5 8 L10 13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </span>
-        <span class="nav-btn" id="nav-fwd" title="Forward (⌘])">
+        </button>
+        <button class="nav-btn" id="nav-fwd" type="button" title="Forward (⌘])" aria-label="Forward">
           <svg viewBox="0 0 16 16" width="15" height="15"><path d="M6 3 L11 8 L6 13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </span>
+        </button>
         <span class="nav-div"></span>
-        <span class="nav-btn" id="nav-undo" title="Undo (⌘Z)">
+        <button class="nav-btn" id="nav-undo" type="button" title="Undo (⌘Z)" aria-label="Undo">
           <svg viewBox="0 0 16 16" width="15" height="15"><path d="M6 5H10a3 3 0 010 6H7 M6 5L8.5 2.5 M6 5l2.5 2.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </span>
-        <span class="nav-btn" id="nav-redo" title="Redo (⌘⇧Z)">
+        </button>
+        <button class="nav-btn" id="nav-redo" type="button" title="Redo (⌘⇧Z)" aria-label="Redo">
           <svg viewBox="0 0 16 16" width="15" height="15"><path d="M10 5H6a3 3 0 000 6H9 M10 5L7.5 2.5 M10 5l-2.5 2.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </span>
+        </button>
         <span class="nav-path" id="nav-path"></span>
       </div>
       <div id="tabbar"></div>
-      <div id="viewer"><div class="empty">Files Claude opens appear here.</div></div>
+      <div id="viewer"><div class="empty">Files agents open appear here.</div></div>
+      <div id="inspector-panel"></div>
     </div>
   </div>
 
@@ -100,11 +213,13 @@
     <div id="history-panel">
       <div id="history-head">
         <span class="h-h-title">Chats &amp; sessions</span>
-        <button id="new-here" class="primary">+ New chat</button>
+        <button id="new-here" class="provider-new claude">+ Claude</button>
+        <button id="new-codex-here" class="provider-new codex">+ Codex</button>
+        <button id="new-worktree" title="Create an isolated branch and agent session">Isolated task…</button>
         <button id="history-new">Open a folder…</button>
-        <span id="history-close" title="Close">
+        <button id="history-close" type="button" title="Close" aria-label="Close session history">
           <svg viewBox="0 0 16 16" width="14" height="14"><path d="M4 4 L12 12 M12 4 L4 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-        </span>
+        </button>
       </div>
       <div id="recent-repos"></div>
       <div id="history-filter">
@@ -118,6 +233,70 @@
     </div>
   </div>
 
+  <div id="tool-overlay" role="dialog" aria-modal="true" aria-labelledby="tool-launcher-title">
+    <div id="tool-launcher">
+      <div class="tool-launcher-head">
+        <div>
+          <span class="dialog-eyebrow">WORKBENCH</span>
+          <h2 id="tool-launcher-title">Open a tool</h2>
+        </div>
+        <button id="tool-launcher-close" type="button" aria-label="Close tool launcher">×</button>
+      </div>
+      <div class="tool-list">
+        <button data-open-tool="review" type="button"><span class="tool-symbol">±</span><span><b>Review</b><small>Inspect and stage branch changes</small></span><kbd>⌥⌘1</kbd></button>
+        <button data-open-tool="terminal" type="button"><span class="tool-symbol">›_</span><span><b>Terminal</b><small>Work with agents and background shells</small></span><kbd>⌥⌘2</kbd></button>
+        <button data-open-tool="files" type="button"><span class="tool-symbol">▱</span><span><b>Files</b><small>Browse and edit the active worktree</small></span><kbd>⌥⌘3</kbd></button>
+      </div>
+      <p class="tool-roadmap">Secure Browser and read-only Side chat are the next workbench modules.</p>
+    </div>
+  </div>
+
+  <div id="pr-overlay" class="dialog-overlay" role="dialog" aria-modal="true" aria-labelledby="pr-dialog-title">
+    <form id="pr-dialog" class="dialog-card">
+      <div class="dialog-eyebrow">GITHUB</div>
+      <h2 id="pr-dialog-title">Create pull request</h2>
+      <p id="pr-summary">Review the target and description before publishing.</p>
+      <div class="pr-route" aria-label="Pull request route">
+        <span id="pr-head">current branch</span>
+        <span aria-hidden="true">→</span>
+        <label><span class="sr-only">Base branch</span><input id="pr-base" required aria-label="Base branch" /></label>
+      </div>
+      <div class="form-grid">
+        <label class="wide"><span>Title</span><input id="pr-title" required maxlength="240" /></label>
+        <label class="wide"><span>Description</span><textarea id="pr-body" rows="7" maxlength="10000" placeholder="Summarize the change and how it was verified."></textarea></label>
+      </div>
+      <div id="pr-dialog-error" role="status"></div>
+      <div class="dialog-actions">
+        <button id="pr-cancel" type="button">Cancel</button>
+        <button id="pr-submit" class="primary" type="submit">Create pull request</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="task-overlay" class="dialog-overlay" role="dialog" aria-modal="true" aria-labelledby="task-dialog-title">
+    <form id="task-dialog" class="dialog-card">
+      <div class="dialog-eyebrow">ISOLATED WORKTREE</div>
+      <h2 id="task-dialog-title">Launch a task</h2>
+      <p>Clide creates a branch-owned checkout, assigns a dev port, and starts the selected agent there.</p>
+      <div class="form-grid">
+        <label><span>Ticket</span><input id="task-ticket" placeholder="KAN-123" /></label>
+        <label class="wide"><span>Task title</span><input id="task-title" required placeholder="Add team billing" /></label>
+        <label class="wide"><span>Worker prompt</span><textarea id="task-prompt" rows="5" required placeholder="Describe the outcome, acceptance criteria, relevant paths, constraints, and checks for the worker."></textarea></label>
+        <label><span>Provider</span><select id="task-provider"><option value="claude">Claude</option><option value="codex">Codex</option></select></label>
+        <label><span>Base ref</span><input id="task-base" value="HEAD" /></label>
+        <label class="wide"><span>Branch</span><input id="task-branch" required placeholder="clide/kan-123-team-billing" /></label>
+        <label class="wide"><span>Setup command (optional)</span><input id="task-setup" placeholder="npm install" /></label>
+        <label class="wide"><span>Dev command (optional)</span><input id="task-dev" placeholder="npm run dev -- --port $PORT" /></label>
+        <label class="wide"><span>Dependencies (optional task IDs, comma separated)</span><input id="task-dependencies" placeholder="task-api, task-schema" /></label>
+      </div>
+      <div id="task-dialog-error"></div>
+      <div class="dialog-actions"><button id="task-cancel" type="button">Cancel</button><button class="primary" type="submit">Create and launch</button></div>
+    </form>
+  </div>
+
+  <script src="../node_modules/@xterm/xterm/lib/xterm.js"></script>
+  <script src="../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+  <script src="../node_modules/markdown-it/dist/markdown-it.min.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>

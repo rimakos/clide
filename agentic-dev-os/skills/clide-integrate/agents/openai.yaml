@@ -1,0 +1,4 @@
+interface:
+  display_name: "Clide Integrate"
+  short_description: "Prepare reviewed worker branches for integration"
+  default_prompt: "Use $clide-integrate to verify completed workers and prepare an explicit safe integration order."

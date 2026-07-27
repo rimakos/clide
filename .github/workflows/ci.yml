@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run rebuild
+      - run: npm run check
+      - run: npm run test:e2e-five
+      - run: npm run test:e2e-orchestrator
+      - run: npm run package:mac
+      # Advisory: upstream advisories should surface without blocking unrelated changes.
+      - run: npm audit --audit-level=high
+        continue-on-error: true

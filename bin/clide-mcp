@@ -1,0 +1,119 @@
+#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const readline = require('readline');
+const http = require('http');
+const { StateStore } = require('../src/main/state-store');
+const { normalizeClaim } = require('../src/main/path-claims');
+const { normalizeWorkspaceContext } = require('../src/shared/workspace-context');
+
+const stateFile = process.env.CLIDE_STATE_FILE || path.join(os.homedir(), '.clide', 'state.db');
+const defaultTaskId = process.env.CLIDE_TASK_ID || '';
+const workspaceRoot = process.env.CLIDE_WORKSPACE_ROOT || '';
+
+// One connection for the life of the server. Opening a DatabaseSync per tool call
+// leaked a file descriptor and a WAL reader on every request.
+let connection = null;
+function store() { return connection || (connection = new StateStore(stateFile)); }
+function task(id) {
+  const current = store().state.tasks[id || defaultTaskId];
+  if (!current) throw new Error('Task not found. Pass taskId or launch through Clide.');
+  return current;
+}
+function result(value) { return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] }; }
+
+const tools = [
+  { name: 'clide_task_get', description: 'Read one Clide task, including dependencies, findings, messages, and checks.', inputSchema: { type: 'object', properties: { taskId: { type: 'string' } } } },
+  { name: 'clide_tasks_list', description: 'List Clide tasks in the local coordination store.', inputSchema: { type: 'object', properties: { repoRoot: { type: 'string' } } } },
+  { name: 'clide_workspace_get', description: 'Read the orchestrator workspace and all repository tasks.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'clide_workspace_context_update', description: 'Update the durable repository brief used for future workers. Orchestrator sessions only.', inputSchema: { type: 'object', properties: { summary: { type: 'string' }, constraints: { type: 'array', items: { type: 'string' } }, commands: { type: 'array', items: { type: 'string' } }, conventions: { type: 'array', items: { type: 'string' } }, decision: { type: 'object', properties: { title: { type: 'string' }, body: { type: 'string' } } } } } },
+  { name: 'clide_dispatch_task', description: 'Create and launch one isolated Claude or Codex worker in the orchestrator repository. Retries with the same dispatchKey are idempotent.', inputSchema: { type: 'object', required: ['title', 'prompt'], properties: {
+    ticket: { type: 'string' }, title: { type: 'string' }, prompt: { type: 'string' }, provider: { enum: ['claude', 'codex'] },
+    branch: { type: 'string' }, baseRef: { type: 'string' }, setupCommand: { type: 'string' }, devCommand: { type: 'string' },
+    dependencies: { type: 'array', items: { type: 'string' }, maxItems: 50 }, pathClaims: { type: 'array', items: { type: 'string' }, maxItems: 100 }, dispatchKey: { type: 'string' }
+  } } },
+  { name: 'clide_publish_finding', description: 'Publish a durable implementation finding for this task and dependent agents.', inputSchema: { type: 'object', required: ['body'], properties: { taskId: { type: 'string' }, body: { type: 'string' }, level: { enum: ['info', 'warning', 'blocking'] } } } },
+  { name: 'clide_send_message', description: 'Add a durable coordination message to a task.', inputSchema: { type: 'object', required: ['body'], properties: { taskId: { type: 'string' }, body: { type: 'string' }, from: { type: 'string' } } } },
+  { name: 'clide_report_check', description: 'Report a command/check result at a commit SHA.', inputSchema: { type: 'object', required: ['command', 'ok'], properties: { taskId: { type: 'string' }, command: { type: 'string' }, ok: { type: 'boolean' }, sha: { type: 'string' }, output: { type: 'string' } } } }
+  , { name: 'clide_claim_paths', description: 'Declare files or globs this task expects to modify so other agents can avoid collisions.', inputSchema: { type: 'object', required: ['paths'], properties: { taskId: { type: 'string' }, paths: { type: 'array', items: { type: 'string' }, maxItems: 100 }, note: { type: 'string' } } } }
+  , { name: 'clide_publish_artifact', description: 'Publish a durable task artifact such as a plan, report, screenshot, or build output.', inputSchema: { type: 'object', required: ['path'], properties: { taskId: { type: 'string' }, path: { type: 'string' }, kind: { type: 'string' }, label: { type: 'string' } } } }
+  , { name: 'clide_set_state', description: 'Set this task lifecycle state.', inputSchema: { type: 'object', required: ['state'], properties: { taskId: { type: 'string' }, state: { enum: ['running', 'waiting', 'approval', 'blocked', 'done'] } } } }
+  , { name: 'clide_request_approval', description: 'Request a durable user approval for a risky or repository-wide action.', inputSchema: { type: 'object', required: ['title', 'body'], properties: { taskId: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' }, command: { type: 'string' } } } }
+];
+
+function postCommand(command) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify({ secret: process.env.CLIDE_SECRET || '', session: process.env.CLIDE_SESSION || '', workspaceRoot, command });
+    const request = http.request({ socketPath: process.env.CLIDE_SOCKET, path: '/command', method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } }, response => {
+      let body = ''; response.setEncoding('utf8'); response.on('data', chunk => { body += chunk; }); response.on('end', () => {
+        let result; try { result = JSON.parse(body || '{}'); } catch { return reject(new Error(body || `Clide command failed (${response.statusCode})`)); }
+        if (response.statusCode >= 400 || result.ok === false) reject(new Error(result.err || `Clide command failed (${response.statusCode})`)); else resolve(result);
+      });
+    });
+    request.setTimeout(120000, () => request.destroy(new Error('Clide dispatch timed out.'))); request.on('error', reject); request.end(payload);
+  });
+}
+
+async function call(name, args = {}) {
+  if (name === 'clide_task_get') return result(task(args.taskId));
+  if (name === 'clide_tasks_list') return result(store().listTasks(args.repoRoot || workspaceRoot));
+  if (name === 'clide_workspace_get') {
+    const db = store(); return result({ workspace: db.state.workspaces[workspaceRoot] || { root: workspaceRoot }, tasks: db.listTasks(workspaceRoot) });
+  }
+  if (name === 'clide_workspace_context_update') {
+    if (process.env.CLIDE_ROLE !== 'orchestrator') throw new Error('Only the repository orchestrator can update workspace context.');
+    const db = store(); const workspace = db.state.workspaces[workspaceRoot] || { root: workspaceRoot };
+    const current = workspace.context || {}; const decisions = [...(current.decisions || [])];
+    if (args.decision && (args.decision.title || args.decision.body)) decisions.push({ id: `${Date.now()}-${process.pid}`, title: args.decision.title, body: args.decision.body, at: new Date().toISOString(), by: process.env.CLIDE_SESSION || 'orchestrator' });
+    const context = normalizeWorkspaceContext({ ...current, ...args, decisions, updatedAt: new Date().toISOString(), updatedBy: process.env.CLIDE_SESSION || 'orchestrator' });
+    return result(db.upsertWorkspace(workspaceRoot, { context }).context);
+  }
+  if (name === 'clide_dispatch_task') return result(await postCommand({ type: 'dispatch-task', ...args }));
+  const current = task(args.taskId);
+  const db = store();
+  const at = new Date().toISOString();
+  if (name === 'clide_publish_finding') {
+    const entry = { id: `${Date.now()}-${process.pid}`, body: String(args.body).slice(0, 8000), level: args.level || 'info', from: defaultTaskId || 'agent', at };
+    return result(db.appendTaskLists(current.id, { findings: [entry] }));
+  }
+  if (name === 'clide_send_message') {
+    const entry = { id: `${Date.now()}-${process.pid}`, body: String(args.body).slice(0, 8000), from: args.from || defaultTaskId || 'agent', at };
+    return result(db.appendTaskLists(current.id, { messages: [entry] }));
+  }
+  if (name === 'clide_report_check') {
+    const entry = { type: 'check', command: String(args.command).slice(0, 1000), ok: Boolean(args.ok), sha: String(args.sha || '').slice(0, 80), output: String(args.output || '').slice(-50000), at };
+    return result(db.appendTaskLists(current.id, { checks: [entry] }));
+  }
+  if (name === 'clide_claim_paths') {
+    const paths = Array.isArray(args.paths) ? args.paths.map(normalizeClaim).slice(0, 100) : [];
+    const claims = paths.map(value => ({ id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, path: value, note: String(args.note || '').slice(0, 500), from: defaultTaskId || 'agent', at }));
+    return result(db.appendTaskLists(current.id, { pathClaims: claims }));
+  }
+  if (name === 'clide_request_approval') {
+    const entry = { id: `${Date.now()}-${process.pid}`, title: String(args.title).slice(0, 200), body: String(args.body).slice(0, 4000), command: String(args.command || '').slice(0, 1000), status: 'pending', requestedAt: at, requestedBy: defaultTaskId || 'agent' };
+    return result(db.appendTaskAudit(current.id, { type: 'approval-requested', actor: entry.requestedBy, reason: entry.title }, { state: 'approval' }, { approvals: [entry] }));
+  }
+  if (name === 'clide_publish_artifact') {
+    const entry = { id: `${Date.now()}-${process.pid}`, path: String(args.path).slice(0, 4096), kind: String(args.kind || 'file').slice(0, 40), label: String(args.label || '').slice(0, 160), from: defaultTaskId || 'agent', at };
+    return result(db.appendTaskLists(current.id, { artifacts: [entry] }));
+  }
+  if (name === 'clide_set_state') return result(db.patchTask(current.id, { state: args.state }));
+  throw new Error(`Unknown tool: ${name}`);
+}
+
+function respond(id, payload) { process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, ...payload })}\n`); }
+
+readline.createInterface({ input: process.stdin }).on('line', async line => {
+  let message;
+  try { message = JSON.parse(line); } catch { return; }
+  if (message.method === 'notifications/initialized') return;
+  if (message.method === 'initialize') return respond(message.id, { result: { protocolVersion: message.params && message.params.protocolVersion || '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'clide', version: '0.2.0' } } });
+  if (message.method === 'tools/list') return respond(message.id, { result: { tools } });
+  if (message.method === 'tools/call') {
+    try { respond(message.id, { result: await call(message.params.name, message.params.arguments) }); }
+    catch (error) { respond(message.id, { result: { isError: true, content: [{ type: 'text', text: error.message }] } }); }
+    return;
+  }
+  if (message.id != null) respond(message.id, { error: { code: -32601, message: 'Method not found' } });
+});
