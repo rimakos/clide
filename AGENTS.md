@@ -5,7 +5,7 @@ launches Claude Code and Codex through `node-pty`, supports task-bound auxiliary
 shells, and creates isolated Git worktrees for parallel work.
 
 Before planning a substantial product change, read
-`CLIDE_IDE_IMPROVEMENT_PLAN.md` and check the current repository state. Preserve
+`docs/CLIDE_IDE_IMPROVEMENT_PLAN.md` and check the current repository state. Preserve
 unrelated and untracked user work.
 
 ## Current architecture

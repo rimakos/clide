@@ -1,11 +1,12 @@
-const pty = require('node-pty');
 const { execFile } = require('child_process');
 const { execFileSync } = require('child_process');
 
 const SCREEN = '/usr/bin/screen';
 
+// Idempotent: an already-prefixed id normalizes back to itself.
 function safeId(value) {
-  return `clide-${String(value || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 54)}`;
+  const body = String(value || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').replace(/^clide-/, '');
+  return `clide-${body.slice(0, 54)}`;
 }
 
 function run(args, options = {}) {
@@ -27,10 +28,10 @@ async function list() {
   return names;
 }
 
-async function exists(id) { return (await list()).has(safeId(id).replace(/^clide-clide-/, 'clide-')); }
+async function exists(id) { return (await list()).has(safeId(id)); }
 
 async function start({ id, command, args = [], cwd, env }) {
-  const name = safeId(id).replace(/^clide-clide-/, 'clide-');
+  const name = safeId(id);
   const recovered = await exists(name);
   if (!recovered) {
     const created = await run(['-dmS', name, command, ...args], { cwd, env });
@@ -40,7 +41,9 @@ async function start({ id, command, args = [], cwd, env }) {
   return { name, recovered };
 }
 
+// Required lazily so the pure helpers stay importable without the native build.
 function attach(name, { cwd, env, cols = 120, rows = 32 } = {}) {
+  const pty = require('node-pty');
   return pty.spawn(SCREEN, ['-x', name], { name: 'xterm-256color', cols, rows, cwd, env });
 }
 

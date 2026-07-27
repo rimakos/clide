@@ -36,6 +36,7 @@ function normalizeTask(input = {}) {
     branch: text(input.branch, 240),
     baseRef: text(input.baseRef, 240) || 'HEAD',
     setupCommand: text(input.setupCommand, 1000),
+    setupCommandSource: input.setupCommandSource === 'agent' ? 'agent' : 'user',
     devCommand: text(input.devCommand, 1000),
     supervisorId: text(input.supervisorId, 120),
     lastSessionId: text(input.lastSessionId, 240),
@@ -72,6 +73,17 @@ function normalizeTask(input = {}) {
   };
 }
 
+const SETUP_APPROVAL_KIND = 'setup-command';
+
+// A setup command written by an agent is arbitrary shell, so it stays gated until the
+// user approves that exact string. Swapping the command invalidates an earlier approval.
+function setupApprovalPending(task) {
+  if (!task || !task.setupCommand || task.setupCommandSource !== 'agent') return false;
+  if (task.dispatch && task.dispatch.setupCompletedAt) return false;
+  return !(task.approvals || []).some(item =>
+    item.kind === SETUP_APPROVAL_KIND && item.status === 'approved' && item.command === task.setupCommand);
+}
+
 function isWithin(root, candidate) {
   if (!root || !candidate) return false;
   const r = path.resolve(root);
@@ -87,4 +99,4 @@ function validHttpUrl(value) {
   } catch { return false; }
 }
 
-module.exports = { TASK_STATES, text, taskSlug, normalizeTask, isWithin, validHttpUrl };
+module.exports = { TASK_STATES, SETUP_APPROVAL_KIND, text, taskSlug, normalizeTask, setupApprovalPending, isWithin, validHttpUrl };

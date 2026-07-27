@@ -6,6 +6,8 @@ test('path claims normalize repository-relative globs', () => {
   assert.equal(normalizeClaim('./src/features/'), 'src/features/**');
   assert.throws(() => normalizeClaim('../secret'), /invalid/i);
   assert.throws(() => normalizeClaim('/tmp/file'), /invalid/i);
+  assert.throws(() => normalizeClaim('src/..'), /invalid/i);
+  assert.throws(() => normalizeClaim('src/../../etc'), /invalid/i);
 });
 
 test('path claims report exact and hotspot overlaps', () => {

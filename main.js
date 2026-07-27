@@ -15,7 +15,7 @@ const { normalizeClaim, claimOverlaps } = require('./src/main/path-claims');
 const { probePort, allocateAvailablePort } = require('./src/main/port-manager');
 const { resizePtySession } = require('./src/main/pty-lifecycle');
 const supervisor = require('./src/main/process-supervisor');
-const { text, taskSlug, isWithin, validHttpUrl } = require('./src/shared/validation');
+const { text, taskSlug, isWithin, validHttpUrl, setupApprovalPending, SETUP_APPROVAL_KIND } = require('./src/shared/validation');
 const { normalizeWorkspaceContext, workerContextPrompt } = require('./src/shared/workspace-context');
 
 const EXPLICIT_CWD = Boolean(process.env.CLIDE_CWD);
@@ -878,6 +878,7 @@ async function createWorktree(payload = {}) {
     id: payload.taskId, title: payload.taskName || payload.title, ticket: payload.ticket,
     provider: payload.provider, state: 'draft', repo: repoName, repoRoot: canonicalRepo,
     worktree: target, branch, baseRef, setupCommand: payload.setupCommand,
+    setupCommandSource: payload.setupCommandSource,
     devCommand: payload.devCommand, port, dependencies: payload.dependencies,
     launchPrompt, createdBy: payload.createdBy, dispatchKey: payload.dispatchKey,
     contextSnapshot,
@@ -890,6 +891,19 @@ async function createWorktree(payload = {}) {
 }
 
 ipcMain.handle('git-worktree-create', async (_event, payload = {}) => createWorktree(payload));
+
+// Agent-supplied setup commands land in the approval queue instead of running on dispatch.
+function requestSetupApproval(task, requestedBy) {
+  const entry = {
+    id: crypto.randomUUID(), kind: SETUP_APPROVAL_KIND,
+    title: 'Approve the setup command for this worker',
+    body: `${task.title} wants to run a setup command in ${task.worktree} before its provider starts. Nothing runs until you approve it.`,
+    command: task.setupCommand, status: 'pending', requestedAt: new Date().toISOString(), requestedBy
+  };
+  return store.appendTaskAudit(task.id,
+    { type: 'approval-requested', actor: requestedBy, reason: entry.title },
+    { state: 'approval' }, { approvals: [entry] });
+}
 
 async function dispatchFromOrchestrator(envelope = {}) {
   if (envelope.secret !== shimSecret) throw new Error('forbidden');
@@ -916,11 +930,13 @@ async function dispatchFromOrchestrator(envelope = {}) {
   const result = await createWorktree({
     cwd: requestedRoot, taskId, taskName: input.title, ticket: input.ticket, provider: providerId,
     branch: input.branch, baseRef: input.baseRef || 'HEAD', setupCommand: input.setupCommand,
+    setupCommandSource: 'agent',
     devCommand: input.devCommand, dependencies, launchPrompt: input.prompt,
     pathClaims: input.pathClaims, dispatchKey, createdBy: `orchestrator:${owner.persistentId}`,
     dispatch: { stage: 'worktree-created', requestedAt: new Date().toISOString(), lastActor: `orchestrator:${owner.persistentId}` }
   });
   if (!result.ok) return result;
+  if (result.task.setupCommand) requestSetupApproval(result.task, `orchestrator:${owner.persistentId}`);
   store.load();
   const blockedBy = (result.task.dependencies || []).filter(id => store.state.tasks[id] && !['done', 'archived'].includes(store.state.tasks[id].state));
   const launch = blockedBy.length === 0;
@@ -1039,17 +1055,21 @@ ipcMain.handle('git-integrate', async (_event, payload = {}) => {
 });
 
 ipcMain.handle('setup-run', async (_event, payload = {}) => {
-  const task = store.state.tasks[payload.taskId];
+  const task = store.snapshot().tasks[payload.taskId];
   if (!task || !task.worktree) return { ok: false, err: 'Task worktree not found.' };
   const command = text(payload.command || task.setupCommand, 1000);
   if (!command) return { ok: true, skipped: true, out: 'No setup command configured.' };
+  // An agent-authored setup command is arbitrary shell. It never runs unattended.
+  if (task.setupCommandSource === 'agent' && (command !== task.setupCommand || setupApprovalPending(task))) {
+    return { ok: false, needsApproval: true, err: 'This setup command was written by an agent and needs your approval before it can run.' };
+  }
   const result = await runFile(process.env.SHELL || '/bin/zsh', ['-lc', command], { cwd: task.worktree, timeout: 15 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
   store.patchTask(task.id, { checks: [...task.checks, { type: 'setup', command, ok: result.ok, output: `${result.out}${result.err}`.slice(-20000), at: new Date().toISOString() }] });
   return result;
 });
 
 ipcMain.handle('checks-run', async (_event, payload = {}) => {
-  const task = store.state.tasks[payload.taskId];
+  const task = store.snapshot().tasks[payload.taskId];
   if (!task || !task.worktree) return { ok: false, err: 'Task worktree not found.' };
   const commands = Array.isArray(payload.commands) ? payload.commands.map(command => text(command, 1000)).filter(Boolean) : [];
   const results = [];
@@ -1203,8 +1223,17 @@ ipcMain.handle('workspace-context-set', (_event, payload = {}) => {
 ipcMain.handle('approval-resolve', (_event, payload = {}) => {
   const task = store.snapshot().tasks[text(payload.taskId, 80)]; if (!task) throw new Error('Task not found.');
   const id = text(payload.approvalId, 120);
+  const resolved = (task.approvals || []).find(item => item.id === id);
   const approvals = (task.approvals || []).map(item => item.id === id ? { ...item, status: payload.approved ? 'approved' : 'rejected', resolvedAt: new Date().toISOString(), resolvedBy: 'user', note: text(payload.note, 1000) } : item);
-  return store.appendTaskAudit(task.id, { type: 'approval-resolved', actor: 'user', reason: `${payload.approved ? 'Approved' : 'Rejected'} ${id}` }, { approvals, state: payload.approved ? 'running' : 'blocked' });
+  const setupGate = Boolean(resolved && resolved.kind === SETUP_APPROVAL_KIND);
+  const patch = { approvals, state: payload.approved ? (setupGate ? 'starting' : 'running') : 'blocked' };
+  if (setupGate && !payload.approved) patch.setupCommand = '';
+  const updated = store.appendTaskAudit(task.id, { type: 'approval-resolved', actor: 'user', reason: `${payload.approved ? 'Approved' : 'Rejected'} ${id}` }, patch);
+  if (setupGate) {
+    if (payload.approved) send('orchestrator-dispatch', { taskId: task.id });
+    else dispatchCoordinator.cancel(task.id, 'user');
+  }
+  return updated;
 });
 ipcMain.handle('layout-set', (_event, payload = {}) => store.setLayout(text(payload.workspace, 4096), text(payload.layout, 40)));
 ipcMain.handle('view-state-get', () => store.state.settings.rendererState || null);

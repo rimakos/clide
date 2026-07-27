@@ -3,6 +3,7 @@ const DISPATCH_STAGES = Object.freeze([
   'worktree-created',
   'waiting-dependencies',
   'waiting-capacity',
+  'waiting-approval',
   'setup-running',
   'launching',
   'provider-ready',
@@ -16,22 +17,27 @@ const DISPATCH_STAGES = Object.freeze([
 const STAGES = new Set(DISPATCH_STAGES);
 const TERMINAL_STAGES = new Set(['running', 'cancelled']);
 const RECOVERABLE_STAGES = new Set([
-  'requested', 'worktree-created', 'waiting-dependencies', 'waiting-capacity', 'setup-running',
-  'launching', 'provider-ready', 'prompt-delivered', 'blocked', 'failed'
+  'requested', 'worktree-created', 'waiting-dependencies', 'waiting-capacity', 'waiting-approval',
+  'setup-running', 'launching', 'provider-ready', 'prompt-delivered', 'blocked', 'failed'
 ]);
 
+const WAITING = ['waiting-dependencies', 'waiting-capacity', 'waiting-approval'];
+
 const ALLOWED = Object.freeze({
-  requested: new Set(['worktree-created', 'waiting-dependencies', 'waiting-capacity', 'failed', 'cancelled']),
-  'worktree-created': new Set(['waiting-dependencies', 'waiting-capacity', 'setup-running', 'launching', 'failed', 'cancelled']),
-  'waiting-dependencies': new Set(['waiting-capacity', 'setup-running', 'launching', 'failed', 'cancelled']),
-  'waiting-capacity': new Set(['waiting-dependencies', 'setup-running', 'launching', 'failed', 'cancelled']),
+  // `requested` is also the fallback stage for an unrecognized record, so it must be
+  // able to reach every stage the coordinator can claim into.
+  requested: new Set(['worktree-created', ...WAITING, 'setup-running', 'launching', 'failed', 'cancelled']),
+  'worktree-created': new Set([...WAITING, 'setup-running', 'launching', 'failed', 'cancelled']),
+  'waiting-dependencies': new Set(['waiting-capacity', 'waiting-approval', 'setup-running', 'launching', 'failed', 'cancelled']),
+  'waiting-capacity': new Set(['waiting-dependencies', 'waiting-approval', 'setup-running', 'launching', 'failed', 'cancelled']),
+  'waiting-approval': new Set(['waiting-dependencies', 'waiting-capacity', 'setup-running', 'launching', 'failed', 'cancelled']),
   'setup-running': new Set(['launching', 'failed', 'cancelled']),
   launching: new Set(['provider-ready', 'failed', 'cancelled']),
   'provider-ready': new Set(['prompt-delivered', 'failed', 'cancelled']),
   'prompt-delivered': new Set(['running', 'failed', 'cancelled']),
   running: new Set(['failed', 'cancelled']),
-  blocked: new Set(['waiting-dependencies', 'setup-running', 'launching', 'failed', 'cancelled']),
-  failed: new Set(['waiting-dependencies', 'setup-running', 'launching', 'cancelled']),
+  blocked: new Set([...WAITING, 'setup-running', 'launching', 'failed', 'cancelled']),
+  failed: new Set([...WAITING, 'setup-running', 'launching', 'cancelled']),
   cancelled: new Set()
 });
 

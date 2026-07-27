@@ -43,7 +43,7 @@
     "electron-builder": "^26.15.3"
   },
   "build": {
-    "appId": "dev.clide.ide",
+    "appId": "com.perparim.clide",
     "productName": "Clide",
     "asar": true,
     "asarUnpack": [

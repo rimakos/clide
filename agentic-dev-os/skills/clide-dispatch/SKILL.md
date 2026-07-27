@@ -39,6 +39,8 @@ Do not include secrets, hidden transcripts, or unsupported assumptions.
 
 Call `clide_dispatch_task` only after the specification is complete. Do not create Git worktrees or start provider CLIs manually.
 
+A `setupCommand` you supply is arbitrary shell, so Clide holds the worker at `waiting-approval` until the user approves that exact command. Keep it to the repository's documented install/build step, and expect a launch to pause there. Omit it entirely when the worker does not need one.
+
 ## Report
 
 Return the task, provider, branch, worktree, port, dependencies, dispatch stage, and whether it launched or remained queued. If creation partially succeeds, preserve the recoverable task and report the exact failed stage.

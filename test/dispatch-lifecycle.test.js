@@ -6,6 +6,12 @@ test('dispatch lifecycle validates forward and recovery transitions', () => {
   assert.equal(canTransition('worktree-created', 'setup-running'), true);
   assert.equal(canTransition('setup-running', 'requested'), false);
   assert.equal(canTransition('failed', 'launching'), true);
+  // `requested` is the fallback for an unreadable record, so every claimable stage
+  // must be reachable from it or recovery throws instead of resuming.
+  assert.equal(canTransition('requested', 'setup-running'), true);
+  assert.equal(canTransition('requested', 'launching'), true);
+  assert.equal(canTransition('waiting-approval', 'setup-running'), true);
+  assert.equal(isRecoverable({ stage: 'waiting-approval' }), true);
 });
 
 test('dispatch normalization is explicit and legacy-safe', () => {

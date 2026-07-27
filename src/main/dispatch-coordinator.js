@@ -1,5 +1,12 @@
 const crypto = require('crypto');
 const { canTransition, isRecoverable, leaseExpired } = require('../shared/dispatch-lifecycle');
+const { setupApprovalPending } = require('../shared/validation');
+
+function waitReason(blockedBy, needsApproval, capacity) {
+  if (blockedBy.length) return `Waiting for ${blockedBy.join(', ')}`;
+  if (needsApproval) return 'Waiting for approval of the agent-supplied setup command';
+  return `Waiting for worker capacity (${capacity.active}/${capacity.limit})`;
+}
 
 class DispatchCoordinator {
   constructor(store, options = {}) {
@@ -37,8 +44,8 @@ class DispatchCoordinator {
     return true;
   }
 
-  capacity(task, tasks) {
-    const configured = Number(this.store.state.settings.maxConcurrentWorkers);
+  capacity(task, tasks, settings = this.store.snapshot().settings) {
+    const configured = Number(settings.maxConcurrentWorkers);
     const limit = Number.isInteger(configured) && configured > 0 ? Math.min(configured, 20) : 5;
     const active = Object.values(tasks).filter(item => item.id !== task.id && item.repoRoot === task.repoRoot && item.dispatch &&
       !['done', 'archived', 'exited'].includes(item.state) &&
@@ -68,12 +75,17 @@ class DispatchCoordinator {
     }
 
     const blockedBy = this.blockedBy(task, snapshot.tasks);
-    const capacity = this.capacity(task, snapshot.tasks);
+    const capacity = this.capacity(task, snapshot.tasks, snapshot.settings);
+    const needsApproval = setupApprovalPending(task);
     let to = task.dispatch.stage;
     let action;
     if (blockedBy.length) {
       if (to === 'waiting-dependencies') return { ok: true, action: 'wait', leaseId: task.dispatch.leaseId, blockedBy, capacity, task };
       if (canTransition(to, 'waiting-dependencies')) to = 'waiting-dependencies';
+      action = 'wait';
+    } else if (needsApproval) {
+      if (to === 'waiting-approval') return { ok: true, action: 'wait', needsApproval, leaseId: task.dispatch.leaseId, blockedBy, capacity, task };
+      if (canTransition(to, 'waiting-approval')) to = 'waiting-approval';
       action = 'wait';
     } else if (!capacity.available) {
       if (to === 'waiting-capacity') return { ok: true, action: 'wait', leaseId: task.dispatch.leaseId, blockedBy, capacity, task };
@@ -90,7 +102,7 @@ class DispatchCoordinator {
     }
 
     if (to === task.dispatch.stage && task.dispatch.leaseId && task.dispatch.leaseOwner === owner && !leaseExpired(task.dispatch)) {
-      return { ok: true, action, leaseId: task.dispatch.leaseId, blockedBy, capacity, task };
+      return { ok: true, action, needsApproval, leaseId: task.dispatch.leaseId, blockedBy, capacity, task };
     }
 
     const leaseId = crypto.randomUUID();
@@ -98,7 +110,7 @@ class DispatchCoordinator {
       expected: task.dispatch.stage,
       to,
       actor: owner,
-      reason: action === 'wait' ? (blockedBy.length ? `Waiting for ${blockedBy.join(', ')}` : `Waiting for worker capacity (${capacity.active}/${capacity.limit})`) : `Claimed durable ${action} action`,
+      reason: action === 'wait' ? waitReason(blockedBy, needsApproval, capacity) : `Claimed durable ${action} action`,
       patch: {
         leaseId,
         leaseOwner: owner,
@@ -110,7 +122,7 @@ class DispatchCoordinator {
       taskPatch: action === 'wait' ? { state: 'waiting' } : { state: 'starting' }
     });
     if (!result.ok) return result;
-    return { ok: true, action, leaseId, blockedBy, capacity, task: result.task };
+    return { ok: true, action, needsApproval, leaseId, blockedBy, capacity, task: result.task };
   }
 
   transition(taskId, input = {}) {
@@ -158,15 +170,20 @@ class DispatchCoordinator {
   }
 
   retry(taskId, actor = 'user') {
-    const task = this.store.snapshot().tasks[taskId];
+    const snapshot = this.store.snapshot();
+    const task = snapshot.tasks[taskId];
     if (!task || !task.dispatch) return { ok: false, error: 'Durable dispatch not found.' };
-    if (!['failed', 'blocked', 'waiting-dependencies', 'waiting-capacity'].includes(task.dispatch.stage)) return { ok: false, error: `Cannot retry ${task.dispatch.stage}.` };
-    const blockedBy = this.blockedBy(task, this.store.state.tasks);
-    const to = blockedBy.length ? 'waiting-dependencies' : (task.setupCommand && !task.dispatch.setupCompletedAt ? 'setup-running' : 'launching');
+    if (!['failed', 'blocked', 'waiting-dependencies', 'waiting-capacity', 'waiting-approval'].includes(task.dispatch.stage)) return { ok: false, error: `Cannot retry ${task.dispatch.stage}.` };
+    const blockedBy = this.blockedBy(task, snapshot.tasks);
+    const needsApproval = setupApprovalPending(task);
+    const waiting = blockedBy.length || needsApproval;
+    const to = blockedBy.length ? 'waiting-dependencies'
+      : needsApproval ? 'waiting-approval'
+        : (task.setupCommand && !task.dispatch.setupCompletedAt ? 'setup-running' : 'launching');
     return this.store.transitionDispatch(taskId, {
       expected: task.dispatch.stage, to, actor, reason: 'Manual retry',
       patch: { leaseId: '', leaseOwner: '', leaseExpiresAt: '', nextRetryAt: '', retryDisabled: false, lastError: '', promptWriteId: '', promptWrittenAt: '' },
-      taskPatch: { state: blockedBy.length ? 'waiting' : 'starting' }
+      taskPatch: { state: waiting ? 'waiting' : 'starting' }
     });
   }
 

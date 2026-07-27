@@ -23,8 +23,27 @@ class StateStore {
     this.migrate();
     this.state = this.readAll();
     this.importLegacyIfEmpty();
+    this.dataVersion = this.readDataVersion();
     for (const suffix of ['', '-wal', '-shm']) { const candidate = `${file}${suffix}`; if (fs.existsSync(candidate)) fs.chmodSync(candidate, 0o600); }
   }
+
+  readDataVersion() {
+    this.dataVersionStatement = this.dataVersionStatement || this.db.prepare('PRAGMA data_version');
+    const row = this.dataVersionStatement.get();
+    return row ? Number(row.data_version) : 0;
+  }
+
+  // `state` is a live view. Writes from another process (the MCP server) bump
+  // PRAGMA data_version, so readers pick them up instead of serving a stale cache.
+  // Writes on this connection leave data_version alone and keep the in-memory copy.
+  get state() {
+    if (this.dataVersion === undefined) return this._state;
+    const version = this.readDataVersion();
+    if (version !== this.dataVersion) { this.dataVersion = version; this._state = this.readAll(); }
+    return this._state;
+  }
+
+  set state(value) { this._state = value; }
 
   migrate() {
     this.db.exec(`
@@ -65,8 +84,12 @@ class StateStore {
     this.setSetting('legacyMigration', { from: this.legacyFile, at: new Date().toISOString(), schema: CURRENT_VERSION });
   }
 
-  load() { this.state = this.readAll(); return this.snapshot(); }
-  snapshot() { this.state = this.readAll(); return structuredClone(this.state); }
+  load() { return this.snapshot(); }
+  snapshot() {
+    this.dataVersion = this.readDataVersion();
+    this._state = this.readAll();
+    return structuredClone(this._state);
+  }
 
   flush() {
     this.db.exec('BEGIN IMMEDIATE');
@@ -124,18 +147,35 @@ class StateStore {
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
 
-  appendTaskAudit(id, entry = {}, patch = {}) {
+  // Appends inside the write transaction so concurrent writers never drop entries.
+  appendTaskLists(id, appends = {}, patch = {}) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.db.prepare('SELECT data FROM tasks WHERE id=?').get(id);
+      if (!row) throw new Error('Task not found.');
+      const previous = parse(row.data, {});
+      const merged = {};
+      for (const [field, items] of Object.entries(appends)) merged[field] = [...(previous[field] || []), ...items];
+      const task = normalizeTask({ ...previous, ...patch, ...merged, id, createdAt: previous.createdAt });
+      this.db.prepare('INSERT OR REPLACE INTO tasks(id,data) VALUES(?,?)').run(id, JSON.stringify(task));
+      this.db.exec('COMMIT'); this.state.tasks[id] = task; return structuredClone(task);
+    } catch (error) { try { this.db.exec('ROLLBACK'); } catch {} throw error; }
+  }
+
+  appendTaskAudit(id, entry = {}, patch = {}, appends = {}) {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const row = this.db.prepare('SELECT data FROM tasks WHERE id=?').get(id);
       if (!row) throw new Error('Task not found.');
       const previous = parse(row.data, {}); const at = entry.at || new Date().toISOString();
+      const merged = {};
+      for (const [field, items] of Object.entries(appends)) merged[field] = [...(previous[field] || []), ...items];
       const audit = [...(previous.audit || []), {
         id: entry.id || `audit-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
         type: String(entry.type || 'event').slice(0, 80), actor: String(entry.actor || 'clide').slice(0, 160),
         reason: String(entry.reason || '').slice(0, 1000), at
       }].slice(-500);
-      const task = normalizeTask({ ...previous, ...patch, id, audit, createdAt: previous.createdAt });
+      const task = normalizeTask({ ...previous, ...patch, ...merged, id, audit, createdAt: previous.createdAt });
       this.db.prepare('INSERT OR REPLACE INTO tasks(id,data) VALUES(?,?)').run(id, JSON.stringify(task));
       this.db.exec('COMMIT'); this.state.tasks[id] = task; return structuredClone(task);
     } catch (error) { try { this.db.exec('ROLLBACK'); } catch {} throw error; }
@@ -191,7 +231,6 @@ class StateStore {
   }
 
   listTasks(workspace) {
-    this.state = this.readAll();
     return Object.values(this.state.tasks)
       .filter(task => !workspace || task.repoRoot === workspace || task.worktree === workspace)
       .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))

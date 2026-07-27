@@ -1370,11 +1370,16 @@ async function processDurableDispatch(taskId) {
   try {
     claim = await ipcRenderer.invoke('dispatch-claim', { taskId, owner: rendererInstance });
     if (!claim || !claim.ok) return;
-    if (claim.action === 'wait') { await refreshTaskSnapshot(); return; }
+    if (claim.action === 'wait') {
+      await refreshTaskSnapshot();
+      if (claim.needsApproval) toast('Setup command needs your approval before this worker can start');
+      return;
+    }
     if (claim.action === 'prompt-uncertain') throw new Error('A previous prompt write may have reached the provider but was not acknowledged. Review the terminal, then use Retry launch only if the prompt is absent.');
     let task = claim.task;
     if (claim.action === 'setup') {
       const setup = await ipcRenderer.invoke('setup-run', { taskId: task.id, command: task.setupCommand });
+      if (setup.needsApproval) { await refreshTaskSnapshot(); toast(setup.err, true); return; }
       if (!setup.ok) throw new Error(`Setup failed: ${(setup.err || setup.out || '').slice(-500)}`);
       const advanced = await ipcRenderer.invoke('dispatch-transition', {
         taskId: task.id, leaseId: claim.leaseId, expected: 'setup-running', to: 'launching',
@@ -1475,7 +1480,7 @@ function renderOrchestratorInbox(session) {
   const panel = $('inspector-panel'); const root = session.workspaceRoot || session.cwd;
   const workspace = taskSnapshot.workspaces && taskSnapshot.workspaces[root] || {}; const context = workspace.context || {};
   const tasks = Object.values(taskSnapshot.tasks || {}).filter(task => task.repoRoot === root && task.state !== 'archived');
-  const inbox = tasks.filter(task => ['waiting', 'approval', 'blocked', 'done'].includes(task.state) || (task.dispatch && ['failed', 'waiting-dependencies', 'waiting-capacity'].includes(task.dispatch.stage)) || (task.approvals || []).some(item => item.status === 'pending'));
+  const inbox = tasks.filter(task => ['waiting', 'approval', 'blocked', 'done'].includes(task.state) || (task.dispatch && ['failed', 'waiting-dependencies', 'waiting-capacity', 'waiting-approval'].includes(task.dispatch.stage)) || (task.approvals || []).some(item => item.status === 'pending'));
   const inboxBody = inbox.map(task => {
     const pending = (task.approvals || []).filter(item => item.status === 'pending').length;
     return `<div class="inbox-card"><b>${escapeHtml(task.ticket || task.title)}</b><span>${escapeHtml(task.dispatch && task.dispatch.stage || task.state)}</span><p>${escapeHtml(task.title)}</p><small>${pending ? `${pending} approval request${pending === 1 ? '' : 's'} · ` : ''}${escapeHtml(task.dev && task.dev.status || '')}</small><button data-focus-task="${escapeHtml(task.id)}">Open</button></div>`;

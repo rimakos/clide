@@ -42,6 +42,29 @@ test('dispatch transitions are atomic and audited', () => {
   assert.equal(final.audit.at(-1).to, 'setup-running');
 });
 
+test('concurrent list appends never drop an entry', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clide-store-append-'));
+  const file = path.join(dir, 'state.db');
+  const first = new StateStore(file); const second = new StateStore(file);
+  const task = first.upsertTask({ title: 'Shared task', repoRoot: '/repo' });
+  first.appendTaskLists(task.id, { findings: [{ body: 'one' }] });
+  second.appendTaskLists(task.id, { findings: [{ body: 'two' }] });
+  first.appendTaskLists(task.id, { findings: [{ body: 'three' }] });
+  assert.deepEqual(second.snapshot().tasks[task.id].findings.map(item => item.body), ['one', 'two', 'three']);
+});
+
+test('cached state picks up writes from another process', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clide-store-fresh-'));
+  const file = path.join(dir, 'state.db');
+  const reader = new StateStore(file); const writer = new StateStore(file);
+  const task = writer.upsertTask({ title: 'Shared task', repoRoot: '/repo' });
+  assert.equal(reader.state.tasks[task.id].state, 'draft');
+  writer.patchTask(task.id, { state: 'running' });
+  assert.equal(reader.state.tasks[task.id].state, 'running');
+  writer.setSetting('maxConcurrentWorkers', 3);
+  assert.equal(reader.state.settings.maxConcurrentWorkers, 3);
+});
+
 test('state store protects its directory and database', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clide-permissions-'));
   const home = path.join(dir, 'private'); const file = path.join(home, 'state.db');

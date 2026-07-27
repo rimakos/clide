@@ -32,7 +32,10 @@ and path claims; Clide then creates and launches the isolated worker automatical
 The orchestrator coordinates the primary checkout but does not implement worker
 tickets there. Dispatch is durable across reloads, provider startup and prompt
 delivery are acknowledged separately, and uncertain delivery requires an explicit
-operator decision. See [CLIDE_DURABLE_ORCHESTRATION_PLAN.md](CLIDE_DURABLE_ORCHESTRATION_PLAN.md).
+operator decision. A setup command written by the orchestrator is arbitrary shell,
+so it never runs unattended: the worker parks at `waiting-approval` and the command
+appears in the Approvals panel for you to approve or reject first. See
+[CLIDE_DURABLE_ORCHESTRATION_PLAN.md](docs/CLIDE_DURABLE_ORCHESTRATION_PLAN.md).
 
 ## Flight-deck features
 

@@ -41,13 +41,17 @@ development terminal, lifecycle record, and audit trail.
 ```text
 requested
   -> worktree-created
-  -> waiting-dependencies | waiting-capacity
+  -> waiting-dependencies | waiting-capacity | waiting-approval
   -> setup-running
   -> launching
   -> provider-ready
   -> prompt-delivered
   -> running
 ```
+
+A setup command supplied by the orchestrator holds the task at `waiting-approval`
+until the user approves that exact command string; changing the command invalidates
+an earlier approval, and rejecting it cancels the dispatch.
 
 Any active stage can fail or be cancelled. Recoverable failures use bounded
 exponential backoff and stop after five attempts. A prompt whose write was recorded

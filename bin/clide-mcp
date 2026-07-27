@@ -12,7 +12,10 @@ const stateFile = process.env.CLIDE_STATE_FILE || path.join(os.homedir(), '.clid
 const defaultTaskId = process.env.CLIDE_TASK_ID || '';
 const workspaceRoot = process.env.CLIDE_WORKSPACE_ROOT || '';
 
-function store() { return new StateStore(stateFile); }
+// One connection for the life of the server. Opening a DatabaseSync per tool call
+// leaked a file descriptor and a WAL reader on every request.
+let connection = null;
+function store() { return connection || (connection = new StateStore(stateFile)); }
 function task(id) {
   const current = store().state.tasks[id || defaultTaskId];
   if (!current) throw new Error('Task not found. Pass taskId or launch through Clide.');
@@ -72,28 +75,28 @@ async function call(name, args = {}) {
   const at = new Date().toISOString();
   if (name === 'clide_publish_finding') {
     const entry = { id: `${Date.now()}-${process.pid}`, body: String(args.body).slice(0, 8000), level: args.level || 'info', from: defaultTaskId || 'agent', at };
-    return result(db.patchTask(current.id, { findings: [...current.findings, entry] }));
+    return result(db.appendTaskLists(current.id, { findings: [entry] }));
   }
   if (name === 'clide_send_message') {
     const entry = { id: `${Date.now()}-${process.pid}`, body: String(args.body).slice(0, 8000), from: args.from || defaultTaskId || 'agent', at };
-    return result(db.patchTask(current.id, { messages: [...current.messages, entry] }));
+    return result(db.appendTaskLists(current.id, { messages: [entry] }));
   }
   if (name === 'clide_report_check') {
     const entry = { type: 'check', command: String(args.command).slice(0, 1000), ok: Boolean(args.ok), sha: String(args.sha || '').slice(0, 80), output: String(args.output || '').slice(-50000), at };
-    return result(db.patchTask(current.id, { checks: [...current.checks, entry] }));
+    return result(db.appendTaskLists(current.id, { checks: [entry] }));
   }
   if (name === 'clide_claim_paths') {
     const paths = Array.isArray(args.paths) ? args.paths.map(normalizeClaim).slice(0, 100) : [];
     const claims = paths.map(value => ({ id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, path: value, note: String(args.note || '').slice(0, 500), from: defaultTaskId || 'agent', at }));
-    return result(db.patchTask(current.id, { pathClaims: [...current.pathClaims, ...claims] }));
+    return result(db.appendTaskLists(current.id, { pathClaims: claims }));
   }
   if (name === 'clide_request_approval') {
     const entry = { id: `${Date.now()}-${process.pid}`, title: String(args.title).slice(0, 200), body: String(args.body).slice(0, 4000), command: String(args.command || '').slice(0, 1000), status: 'pending', requestedAt: at, requestedBy: defaultTaskId || 'agent' };
-    return result(db.appendTaskAudit(current.id, { type: 'approval-requested', actor: entry.requestedBy, reason: entry.title }, { approvals: [...current.approvals, entry], state: 'approval' }));
+    return result(db.appendTaskAudit(current.id, { type: 'approval-requested', actor: entry.requestedBy, reason: entry.title }, { state: 'approval' }, { approvals: [entry] }));
   }
   if (name === 'clide_publish_artifact') {
     const entry = { id: `${Date.now()}-${process.pid}`, path: String(args.path).slice(0, 4096), kind: String(args.kind || 'file').slice(0, 40), label: String(args.label || '').slice(0, 160), from: defaultTaskId || 'agent', at };
-    return result(db.patchTask(current.id, { artifacts: [...current.artifacts, entry] }));
+    return result(db.appendTaskLists(current.id, { artifacts: [entry] }));
   }
   if (name === 'clide_set_state') return result(db.patchTask(current.id, { state: args.state }));
   throw new Error(`Unknown tool: ${name}`);

@@ -2,7 +2,8 @@ const path = require('path');
 
 function normalizeClaim(value) {
   let claim = String(value || '').trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+/g, '/');
-  if (!claim || path.posix.isAbsolute(claim) || claim === '..' || claim.startsWith('../') || claim.includes('/../')) throw new Error(`Invalid repository path claim: ${value}`);
+  const segments = claim.split('/');
+  if (!claim || path.posix.isAbsolute(claim) || segments.includes('..')) throw new Error(`Invalid repository path claim: ${value}`);
   if (claim.endsWith('/')) claim += '**';
   return claim.slice(0, 4096);
 }

@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('path');
-const { taskSlug, normalizeTask, isWithin, validHttpUrl } = require('../src/shared/validation');
+const { taskSlug, normalizeTask, setupApprovalPending, isWithin, validHttpUrl } = require('../src/shared/validation');
 
 test('task slugs are safe and bounded', () => {
   assert.equal(taskSlug(' KAN-42 / Add Billing! '), 'kan-42-add-billing');
@@ -13,6 +13,20 @@ test('tasks normalize provider and state', () => {
   assert.equal(task.provider, 'codex');
   assert.equal(task.state, 'running');
   assert.throws(() => normalizeTask({}), /title/i);
+});
+
+test('agent setup commands stay gated until the exact string is approved', () => {
+  const base = { title: 'Worker', setupCommand: 'npm install' };
+  assert.equal(setupApprovalPending(normalizeTask(base)), false);
+  const agent = normalizeTask({ ...base, setupCommandSource: 'agent' });
+  assert.equal(setupApprovalPending(agent), true);
+  const approved = normalizeTask({
+    ...base, setupCommandSource: 'agent',
+    approvals: [{ id: 'a1', kind: 'setup-command', command: 'npm install', status: 'approved' }]
+  });
+  assert.equal(setupApprovalPending(approved), false);
+  assert.equal(setupApprovalPending(normalizeTask({ ...approved, setupCommand: 'rm -rf /' })), true);
+  assert.equal(setupApprovalPending(normalizeTask({ ...agent, approvals: [{ id: 'a1', kind: 'setup-command', command: 'npm install', status: 'pending' }] })), true);
 });
 
 test('path containment rejects siblings and prefix tricks', () => {
