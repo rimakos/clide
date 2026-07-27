@@ -9,7 +9,8 @@
   "scripts": {
     "start": "electron .",
     "rebuild": "electron-rebuild -f -w node-pty",
-    "setup-os": "bin/setup-os"
+    "setup-os": "bin/setup-os",
+    "package": "rm -rf dist && electron-packager . Clide --platform=darwin --arch=arm64 --icon=build/icon --asar=false --out=dist --overwrite --app-bundle-id=com.perparim.clide"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.10.0",
