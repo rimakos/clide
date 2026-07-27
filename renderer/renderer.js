@@ -850,6 +850,7 @@ function renderMarkdown(s, t) {
     body.innerHTML = '';
     if (m === 'rendered') {
       const div = document.createElement('div'); div.className = 'rendered'; div.innerHTML = md.render(t.body); body.appendChild(div);
+      injectRevealButtons(div);
     } else {
       const ta = document.createElement('textarea'); ta.className = 'editor'; ta.value = t.body; ta.spellcheck = false;
       ta.oninput = () => { t.body = ta.value; markDirty(t); }; body.appendChild(ta);
@@ -860,6 +861,22 @@ function renderMarkdown(s, t) {
   pane.appendChild(body);
   viewer.appendChild(pane);
   setMode(t.mdMode);
+}
+
+const REVEALABLE_EXT = /^\/.+\.(png|jpe?g|gif|webp|svg)$/i;
+function injectRevealButtons(container) {
+  container.querySelectorAll('code').forEach((code) => {
+    const p = code.textContent.trim();
+    if (!REVEALABLE_EXT.test(p)) return;
+    const icon = document.createElement('span');
+    icon.textContent = '📁';
+    icon.title = 'Reveal in Finder — ' + p;
+    icon.style.cssText = 'cursor:pointer; opacity:.6; margin-left:4px; font-size:0.9em;';
+    icon.onmouseenter = () => { icon.style.opacity = '1'; };
+    icon.onmouseleave = () => { icon.style.opacity = '.6'; };
+    icon.onclick = (e) => { e.preventDefault(); e.stopPropagation(); ipcRenderer.send('reveal', p); };
+    code.after(icon);
+  });
 }
 
 function renderImage(t) {

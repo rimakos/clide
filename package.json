@@ -25,6 +25,7 @@
     "test:e2e-five": "node scripts/e2e-five-worktrees.js",
     "test:e2e-orchestrator": "node scripts/e2e-orchestrator.js",
     "doctor": "node bin/doctor",
+    "package": "rm -rf dist && npm run package:mac",
     "package:mac": "electron-builder --mac --dir",
     "dist:mac": "electron-builder --mac --x64 --arm64",
     "release:mac": "electron-builder --mac --x64 --arm64 --publish always"
