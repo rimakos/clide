@@ -1,4 +1,0 @@
-interface:
-  display_name: "Clide Orchestrator"
-  short_description: "Run a repository's AI worker flight deck"
-  default_prompt: "Use $clide-orchestrate to coordinate this repository without implementing worker tickets in the main checkout."

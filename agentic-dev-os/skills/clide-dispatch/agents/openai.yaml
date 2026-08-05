@@ -1,4 +1,0 @@
-interface:
-  display_name: "Clide Dispatch"
-  short_description: "Turn tickets into isolated AI worker tasks"
-  default_prompt: "Use $clide-dispatch to turn this ticket into a validated isolated Claude or Codex worker task."

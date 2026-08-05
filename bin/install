@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-shot Clide installer. Run from the cloned repo:  ./bin/install
-# Does: deps → native rebuild → launcher on PATH → optional provider-neutral skills.
+# Does: deps → native rebuild → launcher on PATH → agentic-dev-os skills.
 set -e
 
 SOURCE="${BASH_SOURCE[0]}"
@@ -16,14 +16,8 @@ echo "==> Clide install ($ROOT)"
 
 # 1. Preflight
 [[ "$(uname)" == "Darwin" ]] || { echo "Clide is macOS-only." >&2; exit 1; }
-command -v node >/dev/null || { echo "Need Node 22.12+. Install from https://nodejs.org" >&2; exit 1; }
-node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>22 || (a===22 && b>=12) ? 0 : 1)' || {
-  echo "Need Node 22.12+ (found $(node --version))." >&2
-  exit 1
-}
-if ! command -v claude >/dev/null && ! command -v codex >/dev/null; then
-  echo "!! Neither 'claude' nor 'codex' was found on PATH — install at least one before running Clide."
-fi
+command -v node >/dev/null || { echo "Need Node 18+. Install from https://nodejs.org" >&2; exit 1; }
+command -v claude >/dev/null || echo "!! 'claude' CLI not found on PATH — install it before running Clide."
 
 # 2. Dependencies + native module
 echo "==> npm install"

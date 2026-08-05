@@ -30,16 +30,8 @@ if [[ ! -f "$abs" ]]; then
   exec /usr/bin/open "${orig[@]}"
 fi
 
-curl_args=(-s -m 2 -X POST)
-if [[ -n "${CLIDE_SOCKET:-}" ]]; then
-  curl_args+=(--unix-socket "$CLIDE_SOCKET")
-  endpoint="http://localhost/open"
-else
-  endpoint="http://127.0.0.1:${CLIDE_PORT:-8771}/open"
-fi
-
-if curl "${curl_args[@]}" "$endpoint" --data-urlencode "path=$abs" \
-     --data-urlencode "session=${CLIDE_SESSION:-}" --data-urlencode "secret=${CLIDE_SECRET:-}" >/dev/null 2>&1; then
+if curl -s -m 2 -X POST "http://127.0.0.1:${CLIDE_PORT:-8771}/open" \
+     --data-urlencode "path=$abs" --data-urlencode "session=${CLIDE_SESSION:-}" >/dev/null 2>&1; then
   exit 0
 fi
 

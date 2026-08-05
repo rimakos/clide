@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Install the canonical bundled skills for both Claude Code and Codex.
+# Install the bundled agentic-dev-os skills into ~/.claude/skills so they're
+# available (/ticket-impact, /wrap, /goal, …) in every Claude session Clide runs.
 # Idempotent: skips a skill that already exists unless you pass --force.
 set -e
 
@@ -11,30 +12,23 @@ while [ -h "$SOURCE" ]; do
 done
 ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 SRC="$ROOT/agentic-dev-os/skills"
-DESTINATIONS=("$HOME/.claude/skills" "$HOME/.agents/skills")
+DEST="$HOME/.claude/skills"
 
 [[ -d "$SRC" ]] || { echo "setup-os: no bundled skills at $SRC" >&2; exit 1; }
+mkdir -p "$DEST"
+
 FORCE=""
-ORCHESTRATOR_ONLY=""
-for arg in "$@"; do
-  [[ "$arg" == "--force" ]] && FORCE=1
-  [[ "$arg" == "--orchestrator" ]] && ORCHESTRATOR_ONLY=1
+[[ "$1" == "--force" ]] && FORCE=1
+
+for d in "$SRC"/*/; do
+  name="$(basename "$d")"
+  if [[ -e "$DEST/$name" && -z "$FORCE" ]]; then
+    echo "skip  $name (exists — use --force to overwrite)"
+    continue
+  fi
+  rm -rf "$DEST/$name"
+  cp -R "$d" "$DEST/$name"
+  echo "ok    $name"
 done
 
-for DEST in "${DESTINATIONS[@]}"; do
-  mkdir -p "$DEST"
-  echo "==> $DEST"
-  for d in "$SRC"/*/; do
-    name="$(basename "$d")"
-    if [[ -n "$ORCHESTRATOR_ONLY" && "$name" != clide-* ]]; then continue; fi
-    if [[ -e "$DEST/$name" && -z "$FORCE" ]]; then
-      echo "skip  $name (exists — use --force to overwrite)"
-      continue
-    fi
-    if [[ -e "$DEST/$name" ]]; then rm -rf "$DEST/$name"; fi
-    cp -R "$d" "$DEST/$name"
-    echo "ok    $name"
-  done
-done
-
-echo "Done. Restart Claude Code or Codex to load the skills."
+echo "Done. Skills in $DEST — restart Claude to pick them up."
