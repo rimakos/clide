@@ -1,4 +1,0 @@
-interface:
-  display_name: "Clide Supervise"
-  short_description: "Monitor workers, blockers, messages, and checks"
-  default_prompt: "Use $clide-supervise to review every active worker and surface only decisions that need attention."
