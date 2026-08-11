@@ -5,6 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execSync, execFile } = require('child_process');
+const { parseStatusZ } = require('./lib/git-status');
 
 const PORT = parseInt(process.env.CLIDE_PORT || '8771', 10);
 const EXPLICIT_CWD = !!process.env.CLIDE_CWD;
@@ -69,12 +70,16 @@ ipcMain.handle('session-start', (_e, { cwd, resumeId }) => {
   const env = Object.assign({}, process.env, {
     PATH: SHIM_DIR + ':' + (process.env.PATH || ''),
     CLIDE_PORT: String(PORT),
-    CLIDE_SESSION: key
+    CLIDE_SESSION: key,
+    CLIDE_HOME: __dirname
   });
   for (const k of Object.keys(env)) {
     if (k.startsWith('npm_') || k === 'NODE_OPTIONS') delete env[k];
   }
-  const claudeCmd = resumeId ? `claude --resume ${resumeId}` : 'claude';
+  // Session-scoped settings (the panel-hint hook). Nothing is installed into ~/.claude.
+  const settings = path.join(__dirname, 'claude', 'settings.json');
+  const flags = fs.existsSync(settings) ? `--settings ${JSON.stringify(settings)}` : '';
+  const claudeCmd = `claude ${flags}${resumeId ? ` --resume ${resumeId}` : ''}`.trim();
   // Re-prepend the shim inside the interactive shell so it survives profile PATH rebuilds
   // (a Finder-launched app has a minimal PATH; the login shell fixes it, we re-assert after).
   const cmd = `export PATH="${SHIM_DIR}:$PATH"; ${claudeCmd}`;
@@ -253,49 +258,48 @@ function gitEnv() {
   for (const k of Object.keys(env)) if (k.startsWith('npm_') || k === 'NODE_OPTIONS') delete env[k];
   return env;
 }
-function runGit(cwd, args) {
+function firstLine(s) { return String(s || '').split('\n').map(x => x.trim()).find(Boolean) || ''; }
+
+// `readOnly` adds GIT_OPTIONAL_LOCKS=0 so status polling never contends with the
+// terminal's own git over index.lock.
+function runGit(cwd, args, readOnly) {
   return new Promise(resolve => {
-    execFile('git', args, { cwd, env: gitEnv(), maxBuffer: 12 * 1024 * 1024 }, (err, stdout, stderr) => {
-      resolve({ ok: !err, out: stdout || '', err: stderr || (err ? err.message : '') });
+    const env = gitEnv();
+    // No terminal is attached, so a credential prompt would block forever. Fail fast instead.
+    env.GIT_TERMINAL_PROMPT = '0';
+    if (readOnly) env.GIT_OPTIONAL_LOCKS = '0';
+    execFile('git', args, { cwd, env, maxBuffer: 12 * 1024 * 1024 }, (err, stdout, stderr) => {
+      resolve({
+        ok: !err,
+        code: err && typeof err.code === 'number' ? err.code : (err ? 1 : 0),
+        out: stdout || '',
+        err: stderr || (err ? err.message : '')
+      });
     });
   });
 }
 
 ipcMain.handle('git-status', async (_e, { cwd }) => {
-  const r = await runGit(cwd, ['status', '--porcelain=v1', '-b', '--untracked-files=all']);
-  if (!r.ok && /not a git repository/i.test(r.err)) return { repo: false };
-  const lines = r.out.split('\n').filter(Boolean);
-  let branch = null, ahead = 0, behind = 0;
-  const files = [];
-  for (const ln of lines) {
-    if (ln.startsWith('## ')) {
-      const head = ln.slice(3);
-      branch = head.split('...')[0].split(' ')[0];
-      const a = /ahead (\d+)/.exec(ln); const b = /behind (\d+)/.exec(ln);
-      ahead = a ? +a[1] : 0; behind = b ? +b[1] : 0;
-      continue;
-    }
-    const x = ln[0], y = ln[1];
-    let p = ln.slice(3);
-    if (p.includes(' -> ')) p = p.split(' -> ')[1];
-    p = p.replace(/^"|"$/g, '');
-    files.push({
-      path: p, index: x, work: y,
-      staged: x !== ' ' && x !== '?',
-      unstaged: y !== ' ' || x === '?',
-      untracked: x === '?'
-    });
+  const r = await runGit(cwd, ['status', '--porcelain=v1', '-z', '-b', '--untracked-files=all'], true);
+  if (!r.ok) {
+    if (/not a git repository/i.test(r.err)) return { repo: false };
+    // Anything else is a real failure. Say so instead of rendering an empty,
+    // healthy-looking panel over a broken repo.
+    return { repo: true, error: firstLine(r.err) || `git exited ${r.code}`, files: [] };
   }
-  return { repo: true, branch, ahead, behind, files };
+  return parseStatusZ(r.out);
 });
 
 ipcMain.handle('git-diff', async (_e, { cwd, file, staged }) => {
-  const args = ['diff'];
+  // core.quotePath=false keeps non-ASCII paths raw in the ---/+++ headers.
+  // There is no -z for diff headers, so the parser still unquotes defensively.
+  const base = ['-c', 'core.quotePath=false', 'diff'];
+  const args = base.slice();
   if (staged) args.push('--cached');
   args.push('--', file);
-  const r = await runGit(cwd, args);
+  const r = await runGit(cwd, args, true);
   if (r.out.trim()) return r.out;
-  const r2 = await runGit(cwd, ['diff', '--no-index', '--', '/dev/null', file]);
+  const r2 = await runGit(cwd, base.concat(['--no-index', '--', '/dev/null', file]), true);
   return r2.out || r.out;
 });
 
@@ -310,8 +314,119 @@ ipcMain.handle('git-create-branch', (_e, { cwd, name }) => runGit(cwd, ['checkou
 ipcMain.handle('git-stage', (_e, { cwd, file }) => runGit(cwd, ['add', '--', file]));
 ipcMain.handle('git-unstage', (_e, { cwd, file }) => runGit(cwd, ['restore', '--staged', '--', file]));
 ipcMain.handle('git-stage-all', (_e, { cwd }) => runGit(cwd, ['add', '-A']));
-ipcMain.handle('git-commit', (_e, { cwd, message }) => runGit(cwd, ['commit', '-m', message]));
-ipcMain.handle('git-push', (_e, { cwd }) => runGit(cwd, ['push']));
+
+// Message of the commit being amended, so the box can be prefilled.
+ipcMain.handle('git-last-message', async (_e, { cwd }) => {
+  const r = await runGit(cwd, ['log', '-1', '--pretty=%B'], true);
+  return r.ok ? r.out.replace(/\n+$/, '') : '';
+});
+
+// JetBrains semantics: the checkboxes are the commit, not the index. Stage any
+// checked path that git doesn't track yet (`commit --only` won't pick those up),
+// then commit exactly the checked set and leave the rest of the index alone.
+ipcMain.handle('git-commit', async (_e, { cwd, message, paths, amend }) => {
+  const list = Array.isArray(paths) ? paths.filter(Boolean) : [];
+  if (!list.length && !amend) return { ok: false, code: 1, out: '', err: 'Nothing selected to commit.' };
+
+  if (list.length) {
+    const add = await runGit(cwd, ['add', '--', ...list]);
+    if (!add.ok) return add;
+  }
+  const args = ['commit'];
+  if (amend) args.push('--amend');
+  args.push('-m', message);
+  if (list.length) args.push('--only', '--', ...list);
+  return runGit(cwd, args);
+});
+
+/* ---------------- log / history ---------------- */
+// %D carries the ref decorations (HEAD -> main, tags, remotes) so the log can
+// label branch tips without a second call.
+ipcMain.handle('git-log', async (_e, { cwd, limit, all }) => {
+  const args = ['-c', 'core.quotePath=false', 'log',
+    `--max-count=${Math.min(Math.max(parseInt(limit, 10) || 200, 1), 2000)}`,
+    '--date=short', '--pretty=format:%H\x1f%h\x1f%P\x1f%s\x1f%an\x1f%ad\x1f%D'];
+  if (all) args.push('--all');
+  const r = await runGit(cwd, args, true);
+  if (!r.ok) return { error: firstLine(r.err) || 'log failed', out: '' };
+  return { out: r.out };
+});
+
+// Files touched by one commit. A merge needs -m --first-parent or git prints
+// nothing at all for it.
+ipcMain.handle('git-commit-files', async (_e, { cwd, sha }) => {
+  const r = await runGit(cwd, ['-c', 'core.quotePath=false', 'show', '--name-status',
+    '-m', '--first-parent', '--pretty=format:', '-z', sha], true);
+  if (!r.ok) return { files: [], error: firstLine(r.err) };
+  // -z gives `STATUS\0path\0`, and renames add a second path field.
+  const parts = r.out.split('\0').filter(s => s !== '');
+  const files = [];
+  for (let i = 0; i < parts.length; i++) {
+    const st = parts[i];
+    if (!/^[A-Z]\d*$/.test(st)) continue;
+    const code = st[0];
+    const p = parts[++i];
+    if (p === undefined) break;
+    const entry = { status: code, path: p, orig: null };
+    if (code === 'R' || code === 'C') { entry.orig = p; entry.path = parts[++i] || p; }
+    files.push(entry);
+  }
+  return { files };
+});
+
+ipcMain.handle('git-commit-diff', async (_e, { cwd, sha, file }) => {
+  const args = ['-c', 'core.quotePath=false', 'show', '-m', '--first-parent',
+    '--pretty=format:', sha];
+  if (file) args.push('--', file);
+  const r = await runGit(cwd, args, true);
+  return r.ok ? r.out : '';
+});
+
+// Without this, ahead/behind is read from a remote ref nothing ever updates, so
+// "behind" sits at 0 forever. Failures are the caller's to ignore: being offline
+// is normal and must not surface as an error.
+ipcMain.handle('git-fetch', (_e, { cwd }) => runGit(cwd, ['fetch', '--prune', '--quiet']));
+
+ipcMain.handle('git-pull', async (_e, { cwd }) => {
+  const up = await runGit(cwd, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], true);
+  if (!up.ok || !up.out.trim()) {
+    return { ok: false, code: 1, out: '', err: 'This branch has no upstream to pull from.' };
+  }
+  return runGit(cwd, ['pull', '--rebase']);
+});
+
+// Commits that a push would send. Empty upstream means the branch is new, so
+// everything not on the default remote head is outgoing.
+ipcMain.handle('git-outgoing', async (_e, { cwd }) => {
+  const up = await runGit(cwd, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], true);
+  const upstream = up.ok ? up.out.trim() : '';
+  const range = upstream ? `${upstream}..HEAD` : 'HEAD';
+  const args = ['log', range, '--max-count=50', '--date=relative',
+    '--pretty=format:%h\x1f%s\x1f%an\x1f%ad'];
+  if (!upstream) args.push('--not', '--remotes');
+  const r = await runGit(cwd, args, true);
+  if (!r.ok) return { upstream, commits: [], error: firstLine(r.err) };
+  const commits = r.out.split('\n').filter(Boolean).map(ln => {
+    const [sha, subject, author, date] = ln.split('\x1f');
+    return { sha, subject, author, date };
+  });
+  return { upstream, commits };
+});
+
+// A bare `git push` fails on every freshly created branch. Resolve the upstream
+// first and set it on the fly when there isn't one.
+ipcMain.handle('git-push', async (_e, { cwd }) => {
+  const up = await runGit(cwd, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], true);
+  if (up.ok && up.out.trim()) return runGit(cwd, ['push']);
+
+  const remotes = await runGit(cwd, ['remote'], true);
+  const remote = remotes.out.split('\n').map(s => s.trim()).filter(Boolean);
+  if (!remote.length) {
+    return { ok: false, code: 1, out: '', err: 'No remote configured. Add one with: git remote add origin <url>' };
+  }
+  const target = remote.includes('origin') ? 'origin' : remote[0];
+  return runGit(cwd, ['push', '-u', target, 'HEAD']);
+});
 
 /* ---------------- file viewers ---------------- */
 ipcMain.handle('list-files', async (_e, cwd) => {
@@ -339,7 +454,7 @@ ipcMain.handle('read-dir', async (_e, dir) => {
     .sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
 });
 
-ipcMain.handle('read-file', async (_e, p) => {
+function readFilePayload(p) {
   const ext = path.extname(p).toLowerCase();
   const name = path.basename(p);
   if (IMG_EXT.includes(ext)) {
@@ -353,9 +468,68 @@ ipcMain.handle('read-file', async (_e, p) => {
   else if (ext === '.md') kind = 'markdown';
   else if (CODE_EXT.includes(ext)) kind = 'code';
   return { path: p, name, ext, kind, content };
+}
+
+ipcMain.handle('read-file', async (_e, p) => readFilePayload(p));
+
+ipcMain.handle('save-file', async (_e, { path: p, content }) => {
+  // Remember what we wrote so the watcher can tell our own save apart from an
+  // edit Claude made, and not bounce the tab back at the user.
+  selfWrites.set(p, content);
+  fs.writeFileSync(p, content, 'utf8');
+  return true;
 });
 
-ipcMain.handle('save-file', async (_e, { path: p, content }) => { fs.writeFileSync(p, content, 'utf8'); return true; });
+/* ---------------- open-file watching ----------------
+ * Claude edits files from the terminal while they sit open in the side panel.
+ * Every path with a tab on it is watched, and a change re-reads and pushes the
+ * new content to the renderer.
+ *
+ * watchFile (stat polling) rather than fs.watch: tools frequently write by
+ * replacing the inode, which silently kills an fs.watch handle, and the polling
+ * cost for the handful of files that are actually open is irrelevant.
+ */
+const watched = new Map();      // path -> { refs, listener }
+const selfWrites = new Map();   // path -> content Clide just wrote
+const WATCH_INTERVAL = 400;
+
+function emitChange(p) {
+  let payload;
+  try { payload = readFilePayload(p); }
+  catch { return; }             // deleted or unreadable: leave the tab alone
+
+  // Our own save round-tripping back through the watcher is not a change.
+  if (selfWrites.has(p)) {
+    const mine = selfWrites.get(p);
+    if (payload.content === mine) { selfWrites.delete(p); return; }
+    selfWrites.delete(p);
+  }
+  if (win) win.webContents.send('file-changed', payload);
+}
+
+ipcMain.on('watch-file', (_e, p) => {
+  if (!p) return;
+  const entry = watched.get(p);
+  if (entry) { entry.refs++; return; }
+  const listener = (curr, prev) => {
+    // mtime alone misses same-second rewrites, so size counts too.
+    if (curr.mtimeMs === prev.mtimeMs && curr.size === prev.size) return;
+    if (curr.mtimeMs === 0) return;   // file went away
+    emitChange(p);
+  };
+  try { fs.watchFile(p, { interval: WATCH_INTERVAL }, listener); }
+  catch { return; }
+  watched.set(p, { refs: 1, listener });
+});
+
+ipcMain.on('unwatch-file', (_e, p) => {
+  const entry = watched.get(p);
+  if (!entry) return;
+  if (--entry.refs > 0) return;
+  try { fs.unwatchFile(p, entry.listener); } catch {}
+  watched.delete(p);
+  selfWrites.delete(p);
+});
 ipcMain.on('copy-image', (_e, p) => clipboard.writeImage(nativeImage.createFromPath(p)));
 ipcMain.on('copy-html', (_e, { html, text }) => clipboard.write({ html, text }));
 ipcMain.on('reveal', (_e, p) => shell.showItemInFolder(p));

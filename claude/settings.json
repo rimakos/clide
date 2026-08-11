@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLIDE_HOME\"/claude/hooks/panel-hint"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+#!/bin/bash
+# Clide UserPromptSubmit hook — tell Claude about the side panel, but only on the
+# turns where the user actually asked to see or copy something.
+#
+# No match  → no output → zero tokens added.
+# Match     → one line of context, that turn only.
+#
+# Edit TRIGGERS below to taste. Case-insensitive, matched against the user's prompt.
+
+TRIGGERS='open|copy|paste|clipboard|show me|preview|render|draft|write me|send|message|email'
+
+prompt="$(/usr/bin/jq -r '.prompt // empty')"
+[ -z "$prompt" ] && exit 0
+
+if ! printf '%s' "$prompt" | /usr/bin/grep -qiE "$TRIGGERS"; then
+  exit 0
+fi
+
+cat <<'EOF'
+You are in Clide: terminal on the left, file viewer panel on the right. Running `open <path>` in bash opens that file as a panel tab (markdown rendered, code highlighted, images previewed) instead of a macOS app. URLs still go to the browser. When the user should see or copy something, write it to a file and `open` it rather than printing it into the terminal.
+EOF
+exit 0

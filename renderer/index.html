@@ -21,6 +21,7 @@
         <div id="panel-tabs">
           <span class="ptab active" data-mode="files" title="Files (⌘B)">Files</span>
           <span class="ptab" data-mode="git" title="Source control">Git<span id="git-count"></span></span>
+          <span class="ptab" data-mode="log" title="History">Log</span>
         </div>
         <span id="explorer-toggle" title="Hide panel (⌘B)">
           <svg viewBox="0 0 16 16" width="14" height="14"><path d="M10 4 L6 8 L10 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -43,18 +44,39 @@
         <div id="git-branch-row">
           <span id="git-branch">—</span>
           <span id="git-aheadbehind"></span>
+          <span id="git-update" title="Update project (pull --rebase)">
+            <svg viewBox="0 0 16 16" width="13" height="13"><path d="M8 2v9 M4.5 7.5 L8 11 L11.5 7.5 M3 13.5h10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </span>
+          <span id="git-push" title="Push">
+            <svg viewBox="0 0 16 16" width="13" height="13"><path d="M8 14V5 M4.5 8.5 L8 5 L11.5 8.5 M3 2.5h10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </span>
           <span id="git-refresh" title="Refresh">
             <svg viewBox="0 0 16 16" width="13" height="13"><path d="M13 8a5 5 0 11-1.5-3.5 M13 2v3h-3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </span>
         </div>
         <div id="git-commit-box">
           <textarea id="git-message" rows="2" placeholder="Commit message" spellcheck="false"></textarea>
+          <label id="git-amend-row" title="Replace the last commit instead of adding a new one">
+            <input type="checkbox" id="git-amend"><span>Amend</span>
+          </label>
           <div id="git-actions">
             <button id="git-commit" class="primary">Commit</button>
-            <button id="git-push">Push</button>
+            <button id="git-commit-push" title="Commit, then push">Commit and Push</button>
           </div>
         </div>
         <div id="git-changes"></div>
+      </div>
+
+      <div id="log-pane">
+        <div id="log-head">
+          <label id="log-all-row" title="Include every branch, not just this one">
+            <input type="checkbox" id="log-all"><span>All branches</span>
+          </label>
+          <span id="log-refresh" title="Refresh">
+            <svg viewBox="0 0 16 16" width="13" height="13"><path d="M13 8a5 5 0 11-1.5-3.5 M13 2v3h-3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </span>
+        </div>
+        <div id="log-list"></div>
       </div>
     </div>
     <div id="divider-left"></div>
@@ -96,6 +118,22 @@
     <span class="st-item" id="st-branch"></span>
   </div>
 
+  <div id="push-overlay">
+    <div id="push-panel">
+      <div id="push-head">
+        <span id="push-title">Push</span>
+        <span id="push-close" title="Close">
+          <svg viewBox="0 0 16 16" width="13" height="13"><path d="M4 4 L12 12 M12 4 L4 12" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        </span>
+      </div>
+      <div id="push-list"></div>
+      <div id="push-actions">
+        <button id="push-cancel">Cancel</button>
+        <button id="push-confirm" class="primary">Push</button>
+      </div>
+    </div>
+  </div>
+
   <div id="history-overlay">
     <div id="history-panel">
       <div id="history-head">
@@ -119,5 +157,8 @@
   </div>
 
   <script src="renderer.js"></script>
+  <script src="panes.js"></script>
+  <script src="git.js"></script>
+  <script src="log.js"></script>
 </body>
 </html>

@@ -5,6 +5,7 @@ const MarkdownIt = require('markdown-it');
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: false });
 const hljs = require('highlight.js');
+const { parseUnifiedDiff, pairRows, countChanges } = require('../lib/diff-parse');
 
 const HLJS_THEMES = ['atom-one-dark', 'tokyo-night-dark', 'github-dark', 'nord', 'monokai', 'vs2015'];
 let codeTheme = localStorage.getItem('clide-code-theme') || 'atom-one-dark';
@@ -92,7 +93,7 @@ function switchSession(key) {
   if (!s) return;
   activeKey = key;
   s.unread = false;
-  for (const o of sessions.values()) o.termEl.style.display = o.key === key ? 'block' : 'none';
+  Panes.show(key);
   renderSessionTabs();
   buildTree(s);
   $('search').value = '';
@@ -110,11 +111,13 @@ function closeSession(key) {
   const s = sessions.get(key);
   if (!s) return;
   ipcRenderer.send('session-kill', { key });
+  for (const t of s.viewerTabs) unrefWatch(t);
   s.term.dispose();
   s.termEl.remove();
   sessions.delete(key);
   const i = order.indexOf(key);
   if (i >= 0) order.splice(i, 1);
+  Panes.remove(key);
   if (activeKey === key) {
     if (order.length) switchSession(order[Math.max(0, i - 1)]);
     else { activeKey = null; renderSessionTabs(); renderTabbar(); renderViewer(); renderStatus(null); }
@@ -145,6 +148,51 @@ ipcRenderer.on('pty-data', (_e, { key, data }) => { const s = sessions.get(key);
 ipcRenderer.on('session-exit', (_e, { key }) => { const s = sessions.get(key); if (s) s.term.write('\r\n\x1b[90m[claude exited — ⌘W to close tab]\x1b[0m\r\n'); });
 ipcRenderer.on('open-file', (_e, { key, path: p }) => openInSession(key || activeKey, p));
 
+/* Claude edits a file from the terminal while it sits open in the panel. Every
+ * tab on that path takes the new content, unless it has unsaved edits, in which
+ * case it is flagged and the user decides. */
+ipcRenderer.on('file-changed', (_e, data) => {
+  let touchedActive = false;
+  for (const s of sessions.values()) {
+    for (const t of s.viewerTabs) {
+      if (t.path !== data.path || !watchable(t)) continue;
+      if (t.dirty) { t.stale = true; t.diskBody = data.content; }
+      else {
+        Object.assign(t, data, { dirty: false, stale: false });
+        t.body = data.content !== undefined ? data.content : t.body;
+      }
+      // Deliberately not marking the session unread: that dot means "Claude is
+      // waiting for you", and a file changing on disk is not that.
+      if (s.key === activeKey && s.viewerTabs[s.activeViewer] === t) touchedActive = true;
+    }
+  }
+  renderTabbar();
+  if (touchedActive) rerenderPreservingScroll();
+});
+
+// The viewer is rebuilt from scratch on every render, so an unattended reload
+// would otherwise throw the reader back to the top of the file.
+function rerenderPreservingScroll() {
+  const scroller = viewer.querySelector('.code-view, .md-body, .editor, .diff, .text-body');
+  const top = scroller ? scroller.scrollTop : 0;
+  const left = scroller ? scroller.scrollLeft : 0;
+  const cls = scroller ? scroller.className : null;
+  renderViewer();
+  if (!cls) return;
+  const next = viewer.querySelector('.' + cls.split(' ').filter(Boolean).join('.'));
+  if (next) { next.scrollTop = top; next.scrollLeft = left; }
+}
+
+// Offered when the file changed underneath unsaved edits.
+function reloadFromDisk(t) {
+  if (t.diskBody === undefined) return;
+  t.body = t.diskBody;
+  t.content = t.diskBody;
+  t.dirty = false; t.stale = false; t.diskBody = undefined;
+  renderTabbar(); renderViewer();
+}
+function keepMine(t) { t.stale = false; t.diskBody = undefined; renderTabbar(); renderViewer(); }
+
 async function openInSession(key, p) {
   const s = sessions.get(key) || cur();
   if (!s) return;
@@ -159,10 +207,14 @@ async function openInSession(key, p) {
 }
 
 /* ===================== terminal sizing / split ===================== */
+// Every session currently mounted in a pane needs fitting, not just the focused
+// one, or the panes you aren't typing in keep the wrong cols/rows.
 function fitActive() {
-  const s = cur(); if (!s) return;
-  try { s.fit.fit(); } catch {}
-  ipcRenderer.send('session-resize', { key: s.key, cols: s.term.cols, rows: s.term.rows });
+  for (const s of sessions.values()) {
+    if (!s.termEl || !terminalsEl.contains(s.termEl)) continue;
+    try { s.fit.fit(); } catch {}
+    ipcRenderer.send('session-resize', { key: s.key, cols: s.term.cols, rows: s.term.rows });
+  }
 }
 window.addEventListener('resize', fitActive);
 
@@ -315,10 +367,18 @@ function pushNav(s, path) {
   if (s === cur()) updateNav();
 }
 
+// Diff and welcome tabs are synthetic; only real files on disk get watched.
+function watchable(t) { return t && t.path && t.kind !== 'diff' && t.kind !== 'welcome'; }
+function refWatch(t) { if (watchable(t)) ipcRenderer.send('watch-file', t.path); }
+function unrefWatch(t) { if (watchable(t)) ipcRenderer.send('unwatch-file', t.path); }
+
 function addTab(s, data) {
   const i = s.viewerTabs.findIndex(t => t.path === data.path);
-  if (i >= 0) { s.viewerTabs[i] = Object.assign(s.viewerTabs[i], data, { dirty: false }); s.activeViewer = i; pushNav(s, data.path); return; }
-  s.viewerTabs.push({ ...data, dirty: false, mdMode: 'rendered', body: data.content });
+  if (i >= 0) { s.viewerTabs[i] = Object.assign(s.viewerTabs[i], data, { dirty: false, stale: false }); s.activeViewer = i; pushNav(s, data.path); return; }
+  refWatch(data);
+  // File tabs carry `content`; diff tabs build their text as `body` directly.
+  // Defaulting to data.content unconditionally left every freshly opened diff blank.
+  s.viewerTabs.push({ ...data, dirty: false, mdMode: 'rendered', body: data.body !== undefined ? data.body : data.content });
   s.activeViewer = s.viewerTabs.length - 1;
   pushNav(s, data.path);
 }
@@ -326,6 +386,7 @@ function closeTab(i) {
   const s = cur(); if (!s) return;
   const t = s.viewerTabs[i];
   if (t && t.kind !== 'diff') s.closedTabs.push(t.path);
+  unrefWatch(t);
   s.viewerTabs.splice(i, 1);
   if (s.activeViewer >= s.viewerTabs.length) s.activeViewer = s.viewerTabs.length - 1;
   renderTabbar(); renderViewer();
@@ -360,11 +421,29 @@ function renderViewer() {
   updateNav();
   if (t.kind === 'welcome') return renderWelcome(s, t);
   if (t.kind === 'diff') return renderDiff(t);
-  if (t.kind === 'image') return renderImage(t);
-  if (t.kind === 'html') return renderHtml(s, t);
-  if (t.kind === 'markdown') return renderMarkdown(s, t);
-  if (t.kind === 'code') return renderCode(s, t);
-  return renderText(s, t);
+  if (t.kind === 'image') renderImage(t);
+  else if (t.kind === 'html') renderHtml(s, t);
+  else if (t.kind === 'markdown') renderMarkdown(s, t);
+  else if (t.kind === 'code') renderCode(s, t);
+  else renderText(s, t);
+  if (t.stale) {
+    const pane = viewer.querySelector('.pane');
+    if (pane) pane.insertBefore(staleBar(t), pane.firstChild);
+  }
+}
+
+// Shown only when the file changed on disk while this tab had unsaved edits.
+// Without edits the tab just updates silently, which is the common case.
+function staleBar(t) {
+  const bar = document.createElement('div');
+  bar.className = 'stale-bar';
+  const msg = document.createElement('span');
+  msg.className = 'stale-msg';
+  msg.textContent = 'Changed on disk while you had unsaved edits.';
+  const reload = btn('Load from disk', 'alt', () => reloadFromDisk(t));
+  const keep = btn('Keep mine', 'alt', () => keepMine(t));
+  bar.appendChild(msg); bar.appendChild(reload); bar.appendChild(keep);
+  return bar;
 }
 
 function renderCode(s, t) {
@@ -439,24 +518,121 @@ function renderHtml(s, t) {
   setMode(t.htmlMode || 'preview');
 }
 
+let diffMode = 'split'; // 'split' | 'unified', remembered across tabs
+
 function renderDiff(t) {
   const pane = document.createElement('div'); pane.className = 'pane';
   const reveal = btn('Open file', 'alt', () => openInSession(activeKey, t.src || t.path));
-  pane.appendChild(toolbar([reveal, spacer(), hint('diff')]));
-  const box = document.createElement('div'); box.className = 'diff';
-  for (const ln of (t.body || '').split('\n')) {
-    const row = document.createElement('div');
-    let cls = 'd-ctx';
-    if (ln.startsWith('+') && !ln.startsWith('+++')) cls = 'd-add';
-    else if (ln.startsWith('-') && !ln.startsWith('---')) cls = 'd-del';
-    else if (ln.startsWith('@@')) cls = 'd-hunk';
-    else if (ln.startsWith('diff ') || ln.startsWith('index ') || ln.startsWith('+++') || ln.startsWith('---')) cls = 'd-meta';
-    row.className = 'd-line ' + cls;
-    row.textContent = ln || ' ';
-    box.appendChild(row);
+  const toggle = btn(diffMode === 'split' ? 'Unified' : 'Side by side', 'alt', () => {
+    diffMode = diffMode === 'split' ? 'unified' : 'split';
+    renderViewer();
+  });
+
+  let parsed;
+  try { parsed = parseUnifiedDiff(t.body || ''); }
+  catch { parsed = { files: [] }; }
+  const { added, removed } = countChanges(parsed);
+  const stat = hint(`+${added} −${removed}`);
+  stat.className = 'hint diff-stat';
+
+  pane.appendChild(toolbar([reveal, toggle, spacer(), stat]));
+
+  const box = document.createElement('div');
+  box.className = diffMode === 'split' ? 'diff diff-split' : 'diff';
+
+  const lang = langFromExt(extOf(t.src || t.path));
+  const files = parsed.files.filter(f => f.hunks.length || f.binary);
+  if (!files.length) {
+    const empty = document.createElement('div');
+    empty.className = 'd-line d-meta';
+    empty.textContent = (t.body || '').trim() ? t.body : '(no textual diff)';
+    box.appendChild(empty);
+  } else if (diffMode === 'split') {
+    for (const f of files) renderSplitFile(box, f, lang);
+  } else {
+    for (const f of files) renderUnifiedFile(box, f, lang);
   }
+
   pane.appendChild(box);
   viewer.appendChild(pane);
+}
+
+// EXT_LANG is keyed with the leading dot ('.js'), so keep it.
+function extOf(p) { const b = String(p || '').split('/').pop(); const i = b.lastIndexOf('.'); return i > 0 ? b.slice(i) : ''; }
+
+// Highlighting one line at a time loses multi-line context (block comments,
+// template literals), which is the accepted trade for aligned rows.
+function hl(text, lang) {
+  if (!text) return '';
+  try {
+    if (lang && hljs.getLanguage(lang)) return hljs.highlight(text, { language: lang }).value;
+  } catch {}
+  return escapeHtml(text);
+}
+
+function hunkHeader(box, h) {
+  const head = document.createElement('div');
+  head.className = 'd-hunkbar';
+  head.textContent = `@@ −${h.oldStart} +${h.newStart} @@${h.heading ? '  ' + h.heading : ''}`;
+  box.appendChild(head);
+}
+
+function renderSplitFile(box, f, lang) {
+  if (f.newPath !== f.oldPath || f.hunks.length) {
+    const title = document.createElement('div');
+    title.className = 'd-filebar';
+    title.textContent = f.oldPath && f.newPath && f.oldPath !== f.newPath
+      ? `${f.oldPath} → ${f.newPath}`
+      : (f.newPath || f.oldPath || '');
+    box.appendChild(title);
+  }
+  if (f.binary) {
+    const b = document.createElement('div');
+    b.className = 'd-line d-meta';
+    b.textContent = '(binary file)';
+    box.appendChild(b);
+    return;
+  }
+  for (const h of f.hunks) {
+    hunkHeader(box, h);
+    for (const p of pairRows(h.rows)) {
+      const row = document.createElement('div');
+      row.className = 'd-row';
+      row.innerHTML =
+        `<span class="d-num">${p.left ? p.left.oldNo : ''}</span>` +
+        `<span class="d-side ${p.left ? (p.kind === 'ctx' ? 'd-ctx' : 'd-del') : 'd-blank'}">${p.left ? hl(p.left.text, lang) : ''}</span>` +
+        `<span class="d-num">${p.right ? p.right.newNo : ''}</span>` +
+        `<span class="d-side ${p.right ? (p.kind === 'ctx' ? 'd-ctx' : 'd-add') : 'd-blank'}">${p.right ? hl(p.right.text, lang) : ''}</span>`;
+      box.appendChild(row);
+    }
+  }
+}
+
+function renderUnifiedFile(box, f, lang) {
+  const title = document.createElement('div');
+  title.className = 'd-filebar';
+  title.textContent = f.newPath || f.oldPath || '';
+  box.appendChild(title);
+  if (f.binary) {
+    const b = document.createElement('div');
+    b.className = 'd-line d-meta'; b.textContent = '(binary file)';
+    box.appendChild(b);
+    return;
+  }
+  for (const h of f.hunks) {
+    hunkHeader(box, h);
+    for (const r of h.rows) {
+      const row = document.createElement('div');
+      row.className = 'd-row d-row-unified';
+      const cls = r.type === 'add' ? 'd-add' : r.type === 'del' ? 'd-del' : 'd-ctx';
+      const sign = r.type === 'add' ? '+' : r.type === 'del' ? '−' : ' ';
+      row.innerHTML =
+        `<span class="d-num">${r.oldNo || ''}</span>` +
+        `<span class="d-num">${r.newNo || ''}</span>` +
+        `<span class="d-side ${cls}"><span class="d-sign">${sign}</span>${hl(r.text, lang)}</span>`;
+      box.appendChild(row);
+    }
+  }
 }
 
 function toolbar(children) { const b = document.createElement('div'); b.className = 'toolbar'; children.forEach(c => b.appendChild(c)); return b; }
@@ -795,107 +971,11 @@ function setPanelMode(mode) {
   document.querySelectorAll('.ptab').forEach(t => t.classList.toggle('active', t.dataset.mode === mode));
   $('files-pane').style.display = mode === 'files' ? 'flex' : 'none';
   $('git-pane').style.display = mode === 'git' ? 'flex' : 'none';
+  $('log-pane').style.display = mode === 'log' ? 'flex' : 'none';
   if (mode === 'git') loadGit();
+  if (mode === 'log') loadLog();
 }
 
-/* ===================== git panel ===================== */
-const gitChanges = $('git-changes');
-function basename(p) { return p.split('/').pop(); }
-function dirpart(p) { const i = p.lastIndexOf('/'); return i >= 0 ? p.slice(0, i) : ''; }
-function statusClass(c) { return ({ M: 'mod', '?': 'new', A: 'add', D: 'del', R: 'ren', U: 'con' })[c] || 'mod'; }
-
-async function loadGit() {
-  const s = cur(); if (!s) return;
-  const st = await ipcRenderer.invoke('git-status', { cwd: s.cwd });
-  if (!st || !st.repo) {
-    $('git-branch').textContent = 'not a git repo'; $('git-aheadbehind').textContent = '';
-    $('git-count').textContent = ''; gitChanges.innerHTML = '<div class="no-results">Not a git repository.</div>';
-    return;
-  }
-  $('git-branch').textContent = st.branch || 'HEAD';
-  let ab = ''; if (st.ahead) ab += `↑${st.ahead}`; if (st.behind) ab += (ab ? ' ' : '') + `↓${st.behind}`;
-  $('git-aheadbehind').textContent = ab;
-  $('git-count').textContent = st.files.length ? ` ${st.files.length}` : '';
-  gitChanges.innerHTML = '';
-  if (!st.files.length) { gitChanges.innerHTML = '<div class="no-results">No changes.</div>'; return; }
-  gitChanges.appendChild(gitZone('Staged', st.files.filter(f => f.staged), true, s));
-  gitChanges.appendChild(gitZone('Changes', st.files.filter(f => f.unstaged), false, s));
-}
-function gitZone(label, files, isStaged, s) {
-  const zone = document.createElement('div');
-  zone.className = 'git-zone ' + (isStaged ? 'zone-staged' : 'zone-unstaged');
-  const h = document.createElement('div'); h.className = 'git-group';
-  h.textContent = `${label} · ${files.length}`;
-  zone.appendChild(h);
-  for (const f of files) {
-    const code = isStaged ? f.index : (f.untracked ? '?' : f.work);
-    const row = document.createElement('div');
-    row.className = 'git-file ' + (isStaged ? 'staged' : 'unstaged');
-    row.draggable = true;
-    row.innerHTML =
-      `<span class="g-status">${code === ' ' ? 'M' : code}</span>` +
-      `<span class="g-name" title="${escapeHtml(f.path)}">${escapeHtml(basename(f.path))}</span>` +
-      `<span class="g-dir">${escapeHtml(dirpart(f.path))}</span>` +
-      `<span class="g-act" title="${isStaged ? 'Unstage' : 'Stage'}">${isStaged ? '−' : '+'}</span>`;
-    row.onclick = e => { if (!e.target.closest('.g-act')) openDiff(s, f.path, isStaged); };
-    row.querySelector('.g-act').onclick = async e => {
-      e.stopPropagation();
-      await ipcRenderer.invoke(isStaged ? 'git-unstage' : 'git-stage', { cwd: s.cwd, file: f.path });
-      loadGit();
-    };
-    row.addEventListener('dragstart', ev => {
-      ev.dataTransfer.setData('application/x-clide-git', f.path);
-      ev.dataTransfer.setData('text/plain', s.cwd + '/' + f.path);
-      ev.dataTransfer.effectAllowed = 'move';
-    });
-    zone.appendChild(row);
-  }
-  zone.addEventListener('dragover', ev => {
-    if ([...ev.dataTransfer.types].includes('application/x-clide-git')) {
-      ev.preventDefault(); ev.dataTransfer.dropEffect = 'move'; zone.classList.add('zone-drop');
-    }
-  });
-  zone.addEventListener('dragleave', ev => { if (!zone.contains(ev.relatedTarget)) zone.classList.remove('zone-drop'); });
-  zone.addEventListener('drop', async ev => {
-    const file = ev.dataTransfer.getData('application/x-clide-git');
-    if (!file) return;
-    ev.preventDefault(); ev.stopPropagation(); zone.classList.remove('zone-drop');
-    await ipcRenderer.invoke(isStaged ? 'git-stage' : 'git-unstage', { cwd: s.cwd, file });
-    loadGit();
-  });
-  return zone;
-}
-async function openDiff(s, file, staged) {
-  let diff = await ipcRenderer.invoke('git-diff', { cwd: s.cwd, file, staged });
-  if (!diff || !diff.trim()) diff = await ipcRenderer.invoke('git-diff', { cwd: s.cwd, file, staged: !staged });
-  const body = (diff && diff.trim()) ? diff : '(no textual diff — binary file or no line changes)';
-  addTab(s, { path: 'diff:' + file, name: basename(file), kind: 'diff', body, src: file, ext: 'diff' });
-  if (s.key === activeKey) { renderTabbar(); renderViewer(); }
-}
-$('git-refresh').onclick = loadGit;
-$('git-commit').onclick = async () => {
-  const s = cur(); if (!s) return;
-  const msg = $('git-message').value.trim();
-  if (!msg) { $('git-message').focus(); return; }
-  const b = $('git-commit'); b.disabled = true;
-  // If nothing is staged, stage everything; otherwise commit exactly what's staged.
-  const st = await ipcRenderer.invoke('git-status', { cwd: s.cwd });
-  const hasStaged = st.repo && st.files.some(f => f.staged);
-  if (!hasStaged) await ipcRenderer.invoke('git-stage-all', { cwd: s.cwd });
-  const r = await ipcRenderer.invoke('git-commit', { cwd: s.cwd, message: msg });
-  b.disabled = false;
-  if (r.ok) { $('git-message').value = ''; toast(hasStaged ? 'Committed staged' : 'Committed all'); }
-  else toast((r.err.split('\n').find(Boolean)) || 'Commit failed', true);
-  loadGit();
-};
-$('git-push').onclick = async () => {
-  const s = cur(); if (!s) return;
-  const b = $('git-push'); b.disabled = true; b.textContent = 'Pushing…';
-  const r = await ipcRenderer.invoke('git-push', { cwd: s.cwd });
-  b.disabled = false; b.textContent = 'Push';
-  toast(r.ok ? 'Pushed' : ((r.err.split('\n').find(Boolean)) || 'Push failed'), !r.ok);
-  loadGit();
-};
 
 /* ===================== viewer nav (back / forward / undo / redo) ===================== */
 $('nav-back').onclick = () => navGo(-1);
@@ -943,7 +1023,9 @@ function notifyClaude(s) {
 window.addEventListener('keydown', e => {
   const mod = e.metaKey || e.ctrlKey;
   if (!mod) return;
-  if (e.shiftKey && (e.key === 't' || e.key === 'T')) { e.preventDefault(); reopenClosed(); }
+  if (e.shiftKey && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); Panes.splitDown(); }
+  else if (e.key === 'd') { e.preventDefault(); Panes.splitRight(); }
+  else if (e.shiftKey && (e.key === 't' || e.key === 'T')) { e.preventDefault(); reopenClosed(); }
   else if (e.key === 't') { e.preventDefault(); openHistory(); }
   else if (e.key === 'p') { e.preventDefault(); setPanelMode('files'); if (explorer.style.display === 'none') toggleExplorer(); searchInput.focus(); searchInput.select(); }
   else if (e.key === 'b') { e.preventDefault(); toggleExplorer(); }

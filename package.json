@@ -8,6 +8,7 @@
   },
   "scripts": {
     "start": "electron .",
+    "test": "node test/git-status.test.js && node test/diff-parse.test.js && node test/git-graph.test.js && node test/git-commands.test.js",
     "rebuild": "electron-rebuild -f -w node-pty",
     "setup-os": "bin/setup-os",
     "package": "rm -rf dist && electron-packager . Clide --platform=darwin --arch=arm64 --icon=build/icon --asar=false --out=dist --overwrite --app-bundle-id=com.perparim.clide"
